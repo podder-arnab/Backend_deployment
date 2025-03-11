@@ -10,6 +10,11 @@ CORS(app, resources={
     r"/scrapped-sub-links": {"origins": "*"}
 })
 
+@app.route('/')
+def home():
+    return "Backend is working!", 200
+
+
 # Register blueprints
 app.register_blueprint(file_api)
 
