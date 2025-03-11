@@ -1,0 +1,101 @@
+{
+  "name": "My workflow 2",
+  "nodes": [
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://ac90-2405-201-9007-9003-7438-4dd7-e139-16f1.ngrok-free.app/recursive-crawl",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n    \"url\": \"https://en.wikipedia.org/wiki/John_Hogan_(motorsport_executive)\",\n    \"depth\": 2\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -60,
+        -40
+      ],
+      "id": "cfb66ac9-1e37-47fe-be67-01e2a301fdab",
+      "name": "HTTP Request"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://ac90-2405-201-9007-9003-7438-4dd7-e139-16f1.ngrok-free.app/process-all-links",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"batch_size\": 10,\n  \"max_retries\": 3\n}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        280,
+        -40
+      ],
+      "id": "726ac1cb-db3a-4d43-8d81-2c08a15a1d6c",
+      "name": "HTTP Request2"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 20
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -300,
+        -40
+      ],
+      "id": "e4b3c4ca-0d17-4059-9596-35cb784074d5",
+      "name": "Schedule Trigger"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request2": {
+      "main": [
+        []
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "a165f578-af01-42b3-b374-a60ca34d49ed",
+  "meta": {
+    "instanceId": "a34561740a212999446ae1f52b6cfa6f432304105abb0afebbeb1ae274042c14"
+  },
+  "id": "19pIL2tW8iO3N8q3",
+  "tags": []
+}
