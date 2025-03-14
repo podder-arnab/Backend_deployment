@@ -2,13 +2,12 @@ from flask import Flask
 from file_api import file_api
 import os
 from flask_cors import CORS
+from user_api import user_api
 # Create the main Flask app
 app = Flask(__name__)
 
-CORS(app, resources={
-    r"/realtime-stats/*": {"origins": "*"},
-    r"/scrapped-sub-links": {"origins": "*"}
-})
+CORS(app)
+
 
 @app.route('/')
 def home():
@@ -17,7 +16,7 @@ def home():
 
 # Register blueprints
 app.register_blueprint(file_api)
-
+app.register_blueprint(user_api)
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))  # Default to 5000 if PORT is not set
