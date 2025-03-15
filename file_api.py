@@ -491,31 +491,63 @@ def continuous_processing_job(top_level_source_url, stop_event, delay_seconds=18
         # Batch size for processing
         batch_size = 50
         
-        # Keep processing until explicitly stopped or all links are processed
+        # Counter for empty check cycles - used to implement better waiting behavior
+        empty_check_cycles = 0
+        max_empty_check_cycles = 5  # Maximum number of empty checks before longer sleep
+        
+        # Keep processing until explicitly stopped
         while not stop_event.is_set():
             # Find a batch of unprocessed links
             with mongo_lock:
                 unprocessed_links = list(links_collection.find({
                     'is_processed': False,
-                    'top_level_source': top_level_source_url
+                    'top_level_source': top_level_source_url,
+                    'is_crawled': True  # Only process links that have been crawled
                 }).limit(batch_size))
             
-            # If no unprocessed links remain, check if we're truly done
+            # If no unprocessed links remain, wait and check again
             if not unprocessed_links:
-                # Double-check after a brief delay to ensure no race conditions
-                time.sleep(3)
-                with mongo_lock:
-                    unprocessed_count = links_collection.count_documents({
-                        'is_processed': False,
-                        'top_level_source': top_level_source_url
-                    })
+                empty_check_cycles += 1
                 
-                if unprocessed_count == 0:
-                    print(f"No more unprocessed links for {top_level_source_url}. Exiting processing job.")
-                    break
+                # If we've had multiple empty cycles, check if there are any uncrawled links left
+                if empty_check_cycles >= max_empty_check_cycles:
+                    with mongo_lock:
+                        uncrawled_count = links_collection.count_documents({
+                            'is_crawled': False,
+                            'top_level_source': top_level_source_url
+                        })
+                        
+                        unprocessed_count = links_collection.count_documents({
+                            'is_processed': False,
+                            'top_level_source': top_level_source_url
+                        })
+                    
+                    # Log status
+                    print(f"Check cycle {empty_check_cycles}: {uncrawled_count} uncrawled links and {unprocessed_count} unprocessed links remaining for {top_level_source_url}")
+                    
+                    # If no uncrawled and no unprocessed links, we're truly done
+                    if uncrawled_count == 0 and unprocessed_count == 0:
+                        print(f"All links for {top_level_source_url} have been crawled and processed. Exiting processing job.")
+                        break
+                    
+                    # If we still have links to process but they're not ready yet, wait longer
+                    if uncrawled_count > 0:
+                        # Reset counter to avoid exiting early
+                        empty_check_cycles = 0
+                        print(f"Waiting for {uncrawled_count} links to be crawled before processing more...")
+                        time.sleep(10)  # Wait longer when waiting for crawling to catch up
+                    else:
+                        # We have unprocessed links but we couldn't find them in our query - try again
+                        empty_check_cycles = 0
+                        time.sleep(2)
                 else:
-                    # If we found more unprocessed links after the delay, continue the loop
-                    continue
+                    # Short wait during normal empty cycles
+                    time.sleep(2)
+                    
+                continue
+            
+            # Reset empty check counter as we found links to process
+            empty_check_cycles = 0
             
             # Process each link in the batch
             for link_doc in unprocessed_links:
@@ -1338,10 +1370,26 @@ def get_all_documents():
         for source_url_doc in source_urls:
             source_url = source_url_doc['source_url']
             
-            # Count the number of processed links for this source URL
-            processed_count = links_collection.count_documents({
+            # Count total URLs for this source
+            total_urls = links_collection.count_documents({
+                'top_level_source': source_url
+            })
+            
+            # Count unprocessed links for this source URL
+            unprocessed_count = links_collection.count_documents({
+                'top_level_source': source_url,
+                'is_processed': False
+            })
+            
+            # Count processed links (both successful and failed)
+            successful_processed = links_collection.count_documents({
                 'top_level_source': source_url,
                 'is_processed': True
+            })
+            
+            failed_processed = links_collection.count_documents({
+                'top_level_source': source_url,
+                'is_processed': "Failed"
             })
             
             # Count the number of scrapped texts for this source URL
@@ -1349,14 +1397,22 @@ def get_all_documents():
                 'top_level_source': source_url
             })
             
-            # Determine the status
-            status = 'Completed' if processed_count == scrapped_count else 'Pending'
+            # Determine the status - if there are no unprocessed links, mark as "Completed"
+            if total_urls == 0:
+                status = 'Pending'
+            elif unprocessed_count == 0:
+                status = 'Completed'
+            else:
+                status = 'Pending'
             
             # Append the document to the list
             documents.append({
                 'source_link': source_url,
                 'status': status,
-                'processed_links': processed_count,
+                'total_urls': total_urls,
+                'unprocessed_links': unprocessed_count,
+                'successful_processed': successful_processed,
+                'failed_processed': failed_processed,
                 'scrapped_texts': scrapped_count,
                 'last_scrapped': source_url_doc['timestamp'].isoformat()
             })
