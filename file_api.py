@@ -459,7 +459,8 @@ def continuous_crawl_job(top_level_source_url, stop_event):
 def continuous_processing_job(top_level_source_url, stop_event, delay_seconds=180):
     """
     Worker function to continuously process all the scraped links
-    Includes an initial delay before starting to process
+    until all links in Links_to_scrap are processed (either successfully or failed).
+    Includes an initial delay before starting processing.
     """
     client = None
     try:
@@ -481,50 +482,94 @@ def continuous_processing_job(top_level_source_url, stop_event, delay_seconds=18
         client = get_mongo_client()
         db = client[DB_NAME]
         links_collection = db[LINKS_COLLECTION]
-        content_collection = db[CONTENT_COLLECTION]
         
         # Stats counters
         links_processed = 0
         success_count = 0
         error_count = 0
         
+        # Batch size for processing
+        batch_size = 50
+        
+        # Keep processing until explicitly stopped or all links are processed
         while not stop_event.is_set():
-            # Find an unprocessed link
+            # Find a batch of unprocessed links
             with mongo_lock:
-                links_remaining = links_collection.count_documents({
+                unprocessed_links = list(links_collection.find({
                     'is_processed': False,
                     'top_level_source': top_level_source_url
-                })
+                }).limit(batch_size))
+            
+            # If no unprocessed links remain, check if we're truly done
+            if not unprocessed_links:
+                # Double-check after a brief delay to ensure no race conditions
+                time.sleep(3)
+                with mongo_lock:
+                    unprocessed_count = links_collection.count_documents({
+                        'is_processed': False,
+                        'top_level_source': top_level_source_url
+                    })
                 
-                # If no more unprocessed links, we're done
-                if links_remaining == 0:
+                if unprocessed_count == 0:
                     print(f"No more unprocessed links for {top_level_source_url}. Exiting processing job.")
                     break
-                
-                # Get one unprocessed link
-                link_doc = links_collection.find_one_and_update(
-                    {'is_processed': False, 'top_level_source': top_level_source_url},
-                    {'$set': {'processing_started': datetime.now()}},
-                    return_document=True
-                )
-                
-                if not link_doc:
-                    # Unlikely, but possible race condition
-                    time.sleep(1)
+                else:
+                    # If we found more unprocessed links after the delay, continue the loop
                     continue
             
-            # Process the link
-            result = scrape_single_link(db, link_doc)
-            
-            if result['status'] == 'success':
-                success_count += 1
-            else:
-                error_count += 1
+            # Process each link in the batch
+            for link_doc in unprocessed_links:
+                if stop_event.is_set():
+                    print(f"Stop event triggered. Exiting processing job for {top_level_source_url}.")
+                    break
                 
-            links_processed += 1
-            
-            # Optional: Sleep to prevent hammering the target server
-            time.sleep(0.5)
+                try:
+                    # Process the link
+                    result = scrape_single_link(db, link_doc)
+                    
+                    if result['status'] == 'success':
+                        success_count += 1
+                    else:
+                        # Mark the link as failed instead of processed
+                        error_count += 1
+                        with mongo_lock:
+                            links_collection.update_one(
+                                {'_id': link_doc['_id']},
+                                {'$set': {
+                                    'is_processed': "Failed",  # Use "Failed" instead of True
+                                    'processed_at': datetime.now(),
+                                    'error': result.get('error', 'Unknown error'),
+                                    'traceback': result.get('traceback', '')
+                                }}
+                            )
+                    
+                    links_processed += 1
+                    
+                    # Log progress periodically
+                    if links_processed % 20 == 0:
+                        print(f"Processed {links_processed} links for {top_level_source_url} ({success_count} successful, {error_count} failed)")
+                    
+                except Exception as e:
+                    # Catch any unexpected errors during processing
+                    error_msg = f"Unexpected error processing link {link_doc.get('link', 'unknown')}: {str(e)}"
+                    print(error_msg)
+                    traceback.print_exc()
+                    
+                    # Mark the link as failed
+                    with mongo_lock:
+                        links_collection.update_one(
+                            {'_id': link_doc['_id']},
+                            {'$set': {
+                                'is_processed': "Failed",
+                                'processed_at': datetime.now(),
+                                'error': error_msg,
+                                'traceback': traceback.format_exc()
+                            }}
+                        )
+                    error_count += 1
+                
+                # Optional: Sleep to prevent hammering the target server
+                time.sleep(0.5)
         
         # Return stats if we exit the loop
         return {
@@ -539,7 +584,7 @@ def continuous_processing_job(top_level_source_url, stop_event, delay_seconds=18
     finally:
         if client:
             client.close()
-
+            
 @file_api.route('/recursive-crawl', methods=['POST'])
 def recursive_crawl():
     """
@@ -617,8 +662,7 @@ def recursive_crawl():
                     'is_processed': False,  # New field to track processing status
                     'depth': 0,  # Starting URL is depth 0
                     'source_url': top_level_source_url,  # Set the source URL as itself for the starting URL
-                    'top_level_source': top_level_source_url,  # Track the top-level source URL
-                    'has_text_in_url': contains_text_in_url(top_level_source_url)  # New field to indicate if URL contains text
+                    'top_level_source': top_level_source_url  # Track the top-level source URL
                 })
                 print(f"Initial URL added to Links_to_scrap: {top_level_source_url}")
         
@@ -664,7 +708,8 @@ def recursive_crawl():
 @file_api.route('/process-all-links', methods=['POST'])
 def process_all_links():
     """
-    Start a background thread to continuously process all links in the Links_to_scrap collection.
+    Start a background thread to continuously process all links in the Links_to_scrap collection
+    until all links are processed (is_processed: true).
     Includes an option to delay the start of processing.
     """
     client = None
@@ -763,22 +808,26 @@ def get_source_url_status():
         # Count total URLs associated with this source in Links_to_scrap collection
         total_urls = links_collection.count_documents({'top_level_source': source_url})
         
-        # Count processed URLs for this source
-        total_processed = links_collection.count_documents({'top_level_source': source_url, 'is_processed': True})
+        # Count processed URLs for this source (both successful and failed)
+        successful_processed = links_collection.count_documents({'top_level_source': source_url, 'is_processed': True})
+        failed_processed = links_collection.count_documents({'top_level_source': source_url, 'is_processed': "Failed"})
+        total_processed = successful_processed + failed_processed
         
         # Count scraped URLs for this source
         total_scrapped = content_collection.count_documents({'top_level_source': source_url})
         
-        # Check if both collections have no documents for this source yet
-        if total_urls == 0 and total_scrapped == 0:
+        # Determine the status
+        if total_urls == 0:
+            # If no URLs are found for this source, it's pending
             status = 'Pending'
-        # If all URLs have been processed and all have been scraped
-        elif total_urls > 0 and total_processed == total_urls and total_processed == total_scrapped:
+        elif total_processed == total_urls:
+            # Only mark as "Completed" if all URLs are processed (either successfully or failed)
             status = 'Completed'
         else:
+            # Otherwise, it's still pending
             status = 'Pending'
         
-        print(f"Source: {source_url}, Total URLs: {total_urls}, Processed: {total_processed}, Scrapped: {total_scrapped}, Status: {status}")
+        print(f"Source: {source_url}, Total URLs: {total_urls}, Successful: {successful_processed}, Failed: {failed_processed}, Total Processed: {total_processed}, Scrapped: {total_scrapped}, Status: {status}")
         
         return jsonify({
             'status': 'success',
@@ -786,7 +835,9 @@ def get_source_url_status():
             'data': {
                 'status': status,
                 'total_urls': total_urls,
-                'processed_urls': total_processed,
+                'successful_processed': successful_processed,
+                'failed_processed': failed_processed,
+                'total_processed': total_processed,
                 'scraped_urls': total_scrapped
             },
             'timestamp': datetime.now().isoformat()
@@ -801,7 +852,7 @@ def get_source_url_status():
     finally:
         if client:
             client.close()
-
+            
 @file_api.route('/stop-crawling', methods=['POST'])
 def stop_crawling():
     """Stop the continuous crawling for a specific source URL"""
@@ -966,9 +1017,9 @@ def scrape_single_link(db, link_doc):
         links_collection.update_one(
             {'_id': link_doc['_id']},
             {'$set': {
-                'is_processed': True, 
+                'is_processed': True,  # Successfully processed
                 'processed_at': datetime.now(),
-                'top_level_source': top_level_source  # Ensure this field is set
+                'top_level_source': top_level_source
             }}
         )
         
@@ -984,20 +1035,9 @@ def scrape_single_link(db, link_doc):
     
     except requests.exceptions.RequestException as e:
         error_msg = f"Request error: {str(e)}"
+        print(f"Failed to scrape {link}: {error_msg}")
         
-        # Update the link with error info
-        links_collection.update_one(
-            {'_id': link_doc['_id']},
-            {
-                '$set': {
-                    'is_processed': True,
-                    'processed_at': datetime.now(),
-                    'error': error_msg,
-                    'top_level_source': top_level_source  # Ensure this field is set
-                }
-            }
-        )
-        
+        # Do not update is_processed here, let the calling function handle it
         return {
             'status': 'error',
             'link': link,
@@ -1008,21 +1048,9 @@ def scrape_single_link(db, link_doc):
     except Exception as e:
         error_msg = f"Processing error: {str(e)}"
         tb = traceback.format_exc()
+        print(f"Failed to scrape {link}: {error_msg}")
         
-        # Update the link with error info
-        links_collection.update_one(
-            {'_id': link_doc['_id']},
-            {
-                '$set': {
-                    'is_processed': True,
-                    'processed_at': datetime.now(),
-                    'error': error_msg,
-                    'traceback': tb,
-                    'top_level_source': top_level_source  # Ensure this field is set
-                }
-            }
-        )
-        
+        # Do not update is_processed here, let the calling function handle it
         return {
             'status': 'error',
             'link': link,
@@ -1030,7 +1058,7 @@ def scrape_single_link(db, link_doc):
             'traceback': tb,
             'top_level_source': top_level_source
         }
-
+    
 # Modified API endpoints to filter by source URL
 
 @file_api.route('/realtime-stats/links-to-scrap', methods=['GET'])
