@@ -15,6 +15,7 @@ from bson.objectid import ObjectId
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import current_app
 from threading import Lock, Thread, Event
+import jwt
 
 # Load environment variables from .env file
 load_dotenv()
@@ -27,6 +28,7 @@ DB_NAME = 'scrapper'
 SOURCE_COLLECTION = 'Content_Links'
 LINKS_COLLECTION = 'Links_to_scrap'
 CONTENT_COLLECTION = 'scrapped_text'
+SECRET_KEY = os.environ.get('SECRET_KEY')
 
 # Global variables to track processing state
 processing_events = {}
@@ -34,8 +36,47 @@ crawling_events = {}
 
 def get_mongo_client():
     """Establish connection to MongoDB"""
-    client = MongoClient(MONGO_URI)
-    return client
+    try:
+        print(f"Connecting to MongoDB with URI: {MONGO_URI[:10]}...{MONGO_URI[-5:]}")
+        client = MongoClient(MONGO_URI)
+        # Test the connection
+        db_names = client.list_database_names()
+        print(f"Connected to MongoDB. Available databases: {db_names}")
+        return client
+    except Exception as e:
+        print(f"MongoDB connection error: {str(e)}")
+        traceback.print_exc()
+        raise
+
+def verify_token():
+    """Verify JWT token and get user_id"""
+    token = request.headers.get('Authorization')
+    
+    if not token or not token.startswith("Bearer "):
+        return None
+
+    token = token.split(" ")[1]
+    try:
+        decoded = jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
+        return decoded['user_id']
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+
+# Authentication decorator
+def token_required(fn):
+    def wrapper(*args, **kwargs):
+        user_id = verify_token()
+        if not user_id:
+            return jsonify({
+                'status': 'error',
+                'message': 'Unauthorized access. Valid token required.',
+                'timestamp': datetime.now().isoformat()
+            }), 401
+        return fn(user_id, *args, **kwargs)
+    wrapper.__name__ = fn.__name__
+    return wrapper
 
 def is_valid_url(url):
     """Enhanced URL validation function"""
@@ -58,6 +99,20 @@ def is_valid_content_url(url):
     # Skip social media URLs
     if is_social_media_url(url):
         return False
+        
+    # Additional checks for common query parameters that indicate non-content
+    if re.search(r'\?(utm_|ref=|source=|campaign=|medium=)', url, re.IGNORECASE):
+        # Only strip these parameters rather than rejecting the URL completely
+        try:
+            base_url = url.split('?')[0]
+            return True
+        except:
+            pass
+            
+    # Add check for fragment identifiers (anchors) which often point to the same content
+    if '#' in url:
+        # We could either strip the fragment or just accept the URL
+        return True
 
     return True
 
@@ -204,17 +259,31 @@ def scrape_link(url):
             'error': str(e)
         }
 
-# Global lock for thread-safe updates to MongoDB
-mongo_lock = Lock()
-
-def continuous_crawl_job(top_level_source_url, stop_event):
+def continuous_crawl_job(top_level_source_url, stop_event, user_id):
     """
     Worker function to continuously crawl pages until all links are processed
     or stop_event is set
     """
     client = None
     try:
-        print(f"Starting continuous crawl job for {top_level_source_url}")
+        print(f"Starting continuous crawl job for {top_level_source_url} for user {user_id}")
+        
+        # Add domain extraction function
+        def extract_domain(url):
+            try:
+                # Remove protocol and get domain
+                if '//' in url:
+                    domain = url.split('//', 1)[1].split('/', 1)[0]
+                else:
+                    domain = url.split('/', 1)[0]
+                return domain.lower()
+            except:
+                return url
+        
+        # Extract the domain from the top-level source URL to restrict crawling
+        original_domain = extract_domain(top_level_source_url)
+        print(f"Original domain to restrict crawling to: {original_domain}")
+        
         client = get_mongo_client()
         db = client[DB_NAME]
         links_collection = db[LINKS_COLLECTION]
@@ -229,50 +298,53 @@ def continuous_crawl_job(top_level_source_url, stop_event):
         max_consecutive_empty_runs = 3  # After this many empty runs, terminate
         
         while not stop_event.is_set():
-            # Find an uncrawled link
-            with mongo_lock:
-                links_remaining = links_collection.count_documents({
-                    'is_crawled': False,
-                    'top_level_source': top_level_source_url
-                })
-                
-                # If no uncrawled links remain, we're done
-                if links_remaining == 0:
-                    print(f"No more uncrawled links for {top_level_source_url}. Exiting crawl job.")
-                    break
-                
-                # Get one uncrawled link
-                link_doc = links_collection.find_one_and_update(
-                    {'is_crawled': False, 'top_level_source': top_level_source_url},
-                    {'$set': {'crawling_started': datetime.now()}},
-                    return_document=True
-                )
-                
-                if not link_doc:
-                    # Unlikely, but possible race condition
-                    time.sleep(1)
-                    continue
+            # Find an uncrawled link for this specific user - without using lock
+            links_remaining = links_collection.count_documents({
+                'is_crawled': False,
+                'top_level_source': top_level_source_url,
+                'user_id': user_id
+            })
+            
+            # If no uncrawled links remain, we're done
+            if links_remaining == 0:
+                print(f"No more uncrawled links for {top_level_source_url} for user {user_id}. Exiting crawl job.")
+                break
+            
+            print(f"Found {links_remaining} uncrawled links to process")
+            
+            # Get one uncrawled link - Use findAndModify operation (find_one_and_update) which is atomic
+            link_doc = links_collection.find_one_and_update(
+                {'is_crawled': False, 'top_level_source': top_level_source_url, 'user_id': user_id},
+                {'$set': {'crawling_started': datetime.now()}},
+                return_document=True
+            )
+            
+            if not link_doc:
+                # Unlikely, but possible race condition
+                print("No uncrawled link found despite count showing some exist. Retrying after delay.")
+                time.sleep(1)
+                continue
             
             # Process the URL
             url_to_crawl = link_doc['link']
             current_depth = link_doc.get('depth', 0)
             top_level_source = link_doc.get('top_level_source', top_level_source_url)
             
-            print(f"Processing URL: {url_to_crawl}")
+            print(f"Processing URL: {url_to_crawl} for user {user_id}")
             
             # Skip social media URLs
             if is_social_media_url(url_to_crawl):
                 print(f"Skipping social media URL: {url_to_crawl}")
-                with mongo_lock:
-                    links_collection.update_one(
-                        {'_id': link_doc['_id']},
-                        {'$set': {
-                            'is_crawled': True, 
-                            'crawled_at': datetime.now(),
-                            'skipped': True,
-                            'skip_reason': 'social_media'
-                        }}
-                    )
+                # Update without using lock
+                links_collection.update_one(
+                    {'_id': link_doc['_id']},
+                    {'$set': {
+                        'is_crawled': True, 
+                        'crawled_at': datetime.now(),
+                        'skipped': True,
+                        'skip_reason': 'social_media'
+                    }}
+                )
                 links_crawled += 1
                 continue
             
@@ -283,10 +355,12 @@ def continuous_crawl_job(top_level_source_url, stop_event):
                 }
                 
                 # Make request to the URL
+                print(f"Making HTTP request to: {url_to_crawl}")
                 response = requests.get(url_to_crawl, headers=headers, timeout=30)
                 response.raise_for_status()  # Raise exception for 4XX/5XX responses
                 
                 # Parse the HTML content
+                print(f"Parsing HTML content from: {url_to_crawl}")
                 soup = BeautifulSoup(response.text, 'html.parser')
                 
                 # Find all anchor tags
@@ -314,15 +388,23 @@ def continuous_crawl_job(top_level_source_url, stop_event):
                         # Convert relative URLs to absolute URLs
                         full_url = urljoin(base_url, href)
                         
+                        # Check if the URL belongs to the same domain - DOMAIN RESTRICTION
+                        link_domain = extract_domain(full_url)
+                        if link_domain != original_domain:
+                            # print(f"Skipping link from different domain: {full_url} (domain: {link_domain})")
+                            continue
+                        
                         # Skip invalid URLs, non-content URLs, and social media URLs
                         if not is_valid_url(full_url) or not is_valid_content_url(full_url) or is_social_media_url(full_url):
                             continue
                         
-                        # Check if the URL already exists in Links_to_scrap
-                        with mongo_lock:
-                            existing_link = links_collection.find_one({'link': full_url})
-                            if existing_link:
-                                continue
+                        # Check if the URL already exists in Links_to_scrap for this user - without lock
+                        existing_link = links_collection.find_one({
+                            'link': full_url,
+                            'user_id': user_id
+                        })
+                        if existing_link:
+                            continue
                             
                         valid_urls.append(full_url)
                     except Exception as e:
@@ -331,69 +413,83 @@ def continuous_crawl_job(top_level_source_url, stop_event):
                 
                 # Remove duplicates
                 unique_links = list(set(valid_urls))
-                print(f"Found {len(unique_links)} valid URLs on {url_to_crawl}")
+                print(f"Found {len(unique_links)} valid URLs on {url_to_crawl} for user {user_id}")
                 
                 # If no valid links are found, mark the URL as crawled and continue
                 if not unique_links:
-                    with mongo_lock:
-                        links_collection.update_one(
-                            {'_id': link_doc['_id']},
-                            {'$set': {
-                                'is_crawled': True, 
-                                'crawled_at': datetime.now(),
-                                'links_found': 0,
-                                'links_added': 0
-                            }}
-                        )
-                    links_crawled += 1
-                    consecutive_empty_runs += 1
-                    continue
-                
-                # Store in Content_Links for reference
-                with mongo_lock:
-                    source_collection = db[SOURCE_COLLECTION]
-                    source_document = {
-                        'source_url': url_to_crawl,
-                        'uniqueLinks': unique_links,
-                        'crawled_at': datetime.now(),
-                        'depth': current_depth,
-                        'top_level_source': top_level_source
-                    }
-                    source_collection.insert_one(source_document)
-                
-                # Add all links to Links_to_scrap
-                current_links_added = 0
-                
-                for link in unique_links:
-                    # Add to Links_to_scrap for further crawling (only if not already exists)
-                    with mongo_lock:
-                        crawl_doc = {
-                            'link': link,
-                            'added_at': datetime.now(),
-                            'is_crawled': False,
-                            'is_processed': False,  # New field to track processing status
-                            'source_url': url_to_crawl,  # Immediate parent URL
-                            'top_level_source': top_level_source,  # Original source URL
-                            'depth': current_depth + 1,  # Increment depth for next level
-                            'has_text_in_url': contains_text_in_url(link)  # New field to indicate if URL contains text
-                        }
-                        result = links_collection.insert_one(crawl_doc)
-                        if result.inserted_id:
-                            current_links_added += 1
-                            print(f"Added new URL to Links_to_scrap: {link}")
-                
-                # Mark this link as crawled
-                with mongo_lock:
+                    print(f"No valid links found on {url_to_crawl}")
                     links_collection.update_one(
                         {'_id': link_doc['_id']},
                         {'$set': {
                             'is_crawled': True, 
                             'crawled_at': datetime.now(),
-                            'links_found': len(unique_links),
-                            'links_added': current_links_added
+                            'links_found': 0,
+                            'links_added': 0
                         }}
                     )
-                    print(f"Marked URL as crawled: {url_to_crawl}")
+                    links_crawled += 1
+                    consecutive_empty_runs += 1
+                    continue
+                
+                # Store in Content_Links for reference - without lock
+                source_collection = db[SOURCE_COLLECTION]
+                source_document = {
+                    'source_url': url_to_crawl,
+                    'uniqueLinks': unique_links,
+                    'crawled_at': datetime.now(),
+                    'depth': current_depth,
+                    'top_level_source': top_level_source,
+                    'user_id': user_id  # Associate with specific user
+                }
+                
+                print(f"Storing source document for {url_to_crawl}")
+                source_result = source_collection.insert_one(source_document)
+                print(f"Source document stored with ID: {source_result.inserted_id}")
+                
+                # Add all links to Links_to_scrap
+                current_links_added = 0
+                
+                for link in unique_links:
+                    # Add to Links_to_scrap for further crawling (only if not already exists) - without lock
+                    print(f"Adding link to queue: {link}")
+                    crawl_doc = {
+                        'link': link,
+                        'added_at': datetime.now(),
+                        'is_crawled': False,
+                        'is_processed': False,
+                        'source_url': url_to_crawl,
+                        'top_level_source': top_level_source,
+                        'depth': current_depth + 1,
+                        'has_text_in_url': contains_text_in_url(link),
+                        'user_id': user_id
+                    }
+                    
+                    try:
+                        # Use upsert with a filter to prevent duplicates
+                        result = links_collection.update_one(
+                            {'link': link, 'user_id': user_id},
+                            {'$setOnInsert': crawl_doc},
+                            upsert=True
+                        )
+                        
+                        if result.upserted_id:
+                            current_links_added += 1
+                            print(f"Added new URL to Links_to_scrap: {link} for user {user_id}")
+                    except Exception as insert_error:
+                        print(f"Error adding link {link} to queue: {str(insert_error)}")
+                
+                # Mark this link as crawled - without lock
+                print(f"Marking URL as crawled: {url_to_crawl}")
+                links_collection.update_one(
+                    {'_id': link_doc['_id']},
+                    {'$set': {
+                        'is_crawled': True, 
+                        'crawled_at': datetime.now(),
+                        'links_found': len(unique_links),
+                        'links_added': current_links_added
+                    }}
+                )
+                print(f"Marked URL as crawled: {url_to_crawl} for user {user_id}")
                 
                 links_crawled += 1
                 links_added += current_links_added
@@ -411,36 +507,41 @@ def continuous_crawl_job(top_level_source_url, stop_event):
                 
             except requests.exceptions.RequestException as e:
                 error_msg = f"Request error: {str(e)}"
-                with mongo_lock:
-                    links_collection.update_one(
-                        {'_id': link_doc['_id']},
-                        {'$set': {
-                            'is_crawled': True, 
-                            'crawled_at': datetime.now(),
-                            'error': error_msg
-                        }}
-                    )
+                print(f"Error processing URL {url_to_crawl}: {error_msg}")
+                
+                # Update without lock
+                links_collection.update_one(
+                    {'_id': link_doc['_id']},
+                    {'$set': {
+                        'is_crawled': True, 
+                        'crawled_at': datetime.now(),
+                        'error': error_msg
+                    }}
+                )
                 errors_encountered += 1
                 consecutive_empty_runs += 1
-                print(f"Error processing URL {url_to_crawl}: {error_msg}")
                 
             except Exception as e:
                 error_msg = f"Error: {str(e)}"
-                with mongo_lock:
-                    links_collection.update_one(
-                        {'_id': link_doc['_id']},
-                        {'$set': {
-                            'is_crawled': True, 
-                            'crawled_at': datetime.now(),
-                            'error': error_msg
-                        }}
-                    )
+                print(f"Error processing URL {url_to_crawl}: {error_msg}")
+                traceback.print_exc()
+                
+                # Update without lock
+                links_collection.update_one(
+                    {'_id': link_doc['_id']},
+                    {'$set': {
+                        'is_crawled': True, 
+                        'crawled_at': datetime.now(),
+                        'error': error_msg
+                    }}
+                )
                 errors_encountered += 1
                 consecutive_empty_runs += 1
-                print(f"Error processing URL {url_to_crawl}: {error_msg}")
             
             # Optional: Sleep to prevent hammering the target server
             time.sleep(0.5)
+        
+        print(f"Crawl job completed: {links_crawled} links crawled, {links_added} links added, {errors_encountered} errors")
         
         # Return stats if we exit the loop
         return {
@@ -452,11 +553,15 @@ def continuous_crawl_job(top_level_source_url, stop_event):
     except Exception as e:
         print(f"Error in continuous crawl job: {str(e)}")
         traceback.print_exc()
+        return {
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }
     finally:
         if client:
             client.close()
 
-def continuous_processing_job(top_level_source_url, stop_event, delay_seconds=180):
+def continuous_processing_job(top_level_source_url, stop_event, delay_seconds=180, user_id=None):
     """
     Worker function to continuously process all the scraped links
     until all links in Links_to_scrap are processed (either successfully or failed).
@@ -464,7 +569,7 @@ def continuous_processing_job(top_level_source_url, stop_event, delay_seconds=18
     """
     client = None
     try:
-        print(f"Starting processing job for {top_level_source_url} with {delay_seconds}s delay")
+        print(f"Starting processing job for {top_level_source_url} with {delay_seconds}s delay for user {user_id}")
         
         # Wait for the specified delay before starting processing
         print(f"Waiting {delay_seconds} seconds before starting processing...")
@@ -477,7 +582,7 @@ def continuous_processing_job(top_level_source_url, stop_event, delay_seconds=18
             print(f"Processing job for {top_level_source_url} was stopped during delay")
             return
             
-        print(f"Delay complete, beginning processing for {top_level_source_url}")
+        print(f"Delay complete, beginning processing for {top_level_source_url} for user {user_id}")
         
         client = get_mongo_client()
         db = client[DB_NAME]
@@ -491,63 +596,37 @@ def continuous_processing_job(top_level_source_url, stop_event, delay_seconds=18
         # Batch size for processing
         batch_size = 50
         
-        # Counter for empty check cycles - used to implement better waiting behavior
-        empty_check_cycles = 0
-        max_empty_check_cycles = 5  # Maximum number of empty checks before longer sleep
-        
-        # Keep processing until explicitly stopped
+        # Keep processing until explicitly stopped or all links are processed
         while not stop_event.is_set():
-            # Find a batch of unprocessed links
-            with mongo_lock:
-                unprocessed_links = list(links_collection.find({
-                    'is_processed': False,
-                    'top_level_source': top_level_source_url,
-                    'is_crawled': True  # Only process links that have been crawled
-                }).limit(batch_size))
+            # Find a batch of unprocessed links for this user without using lock
+            query = {
+                'is_processed': False,
+                'top_level_source': top_level_source_url
+            }
             
-            # If no unprocessed links remain, wait and check again
-            if not unprocessed_links:
-                empty_check_cycles += 1
+            # Add user_id filter if provided
+            if user_id:
+                query['user_id'] = user_id
                 
-                # If we've had multiple empty cycles, check if there are any uncrawled links left
-                if empty_check_cycles >= max_empty_check_cycles:
-                    with mongo_lock:
-                        uncrawled_count = links_collection.count_documents({
-                            'is_crawled': False,
-                            'top_level_source': top_level_source_url
-                        })
-                        
-                        unprocessed_count = links_collection.count_documents({
-                            'is_processed': False,
-                            'top_level_source': top_level_source_url
-                        })
-                    
-                    # Log status
-                    print(f"Check cycle {empty_check_cycles}: {uncrawled_count} uncrawled links and {unprocessed_count} unprocessed links remaining for {top_level_source_url}")
-                    
-                    # If no uncrawled and no unprocessed links, we're truly done
-                    if uncrawled_count == 0 and unprocessed_count == 0:
-                        print(f"All links for {top_level_source_url} have been crawled and processed. Exiting processing job.")
-                        break
-                    
-                    # If we still have links to process but they're not ready yet, wait longer
-                    if uncrawled_count > 0:
-                        # Reset counter to avoid exiting early
-                        empty_check_cycles = 0
-                        print(f"Waiting for {uncrawled_count} links to be crawled before processing more...")
-                        time.sleep(10)  # Wait longer when waiting for crawling to catch up
-                    else:
-                        # We have unprocessed links but we couldn't find them in our query - try again
-                        empty_check_cycles = 0
-                        time.sleep(2)
-                else:
-                    # Short wait during normal empty cycles
-                    time.sleep(2)
-                    
-                continue
+            unprocessed_links = list(links_collection.find(query).limit(batch_size))
             
-            # Reset empty check counter as we found links to process
-            empty_check_cycles = 0
+            # If no unprocessed links remain, check if we're truly done
+            if not unprocessed_links:
+                print(f"No unprocessed links found in this batch. Double-checking after delay.")
+                # Double-check after a brief delay to ensure no race conditions
+                time.sleep(3)
+                
+                unprocessed_count = links_collection.count_documents(query)
+                
+                if unprocessed_count == 0:
+                    print(f"No more unprocessed links for {top_level_source_url} for user {user_id}. Exiting processing job.")
+                    break
+                else:
+                    print(f"Found {unprocessed_count} unprocessed links after delay. Continuing processing.")
+                    # If we found more unprocessed links after the delay, continue the loop
+                    continue
+            
+            print(f"Processing batch of {len(unprocessed_links)} links")
             
             # Process each link in the batch
             for link_doc in unprocessed_links:
@@ -556,30 +635,36 @@ def continuous_processing_job(top_level_source_url, stop_event, delay_seconds=18
                     break
                 
                 try:
-                    # Process the link
-                    result = scrape_single_link(db, link_doc)
+                    link_url = link_doc.get('link', 'unknown')
+                    print(f"Processing link: {link_url}")
+                    
+                    # Process the link including user_id
+                    result = scrape_single_link(db, link_doc, user_id)
                     
                     if result['status'] == 'success':
                         success_count += 1
+                        print(f"Successfully processed link: {link_url}")
                     else:
                         # Mark the link as failed instead of processed
                         error_count += 1
-                        with mongo_lock:
-                            links_collection.update_one(
-                                {'_id': link_doc['_id']},
-                                {'$set': {
-                                    'is_processed': "Failed",  # Use "Failed" instead of True
-                                    'processed_at': datetime.now(),
-                                    'error': result.get('error', 'Unknown error'),
-                                    'traceback': result.get('traceback', '')
-                                }}
-                            )
+                        print(f"Failed to process link: {link_url}. Error: {result.get('error', 'Unknown error')}")
+                        
+                        # Update without using lock - MongoDB handles concurrency
+                        links_collection.update_one(
+                            {'_id': link_doc['_id']},
+                            {'$set': {
+                                'is_processed': "Failed",  # Use "Failed" instead of True
+                                'processed_at': datetime.now(),
+                                'error': result.get('error', 'Unknown error'),
+                                'traceback': result.get('traceback', '')
+                            }}
+                        )
                     
                     links_processed += 1
                     
                     # Log progress periodically
                     if links_processed % 20 == 0:
-                        print(f"Processed {links_processed} links for {top_level_source_url} ({success_count} successful, {error_count} failed)")
+                        print(f"Processed {links_processed} links for {top_level_source_url} ({success_count} successful, {error_count} failed) for user {user_id}")
                     
                 except Exception as e:
                     # Catch any unexpected errors during processing
@@ -587,21 +672,22 @@ def continuous_processing_job(top_level_source_url, stop_event, delay_seconds=18
                     print(error_msg)
                     traceback.print_exc()
                     
-                    # Mark the link as failed
-                    with mongo_lock:
-                        links_collection.update_one(
-                            {'_id': link_doc['_id']},
-                            {'$set': {
-                                'is_processed': "Failed",
-                                'processed_at': datetime.now(),
-                                'error': error_msg,
-                                'traceback': traceback.format_exc()
-                            }}
-                        )
+                    # Mark the link as failed without using lock
+                    links_collection.update_one(
+                        {'_id': link_doc['_id']},
+                        {'$set': {
+                            'is_processed': "Failed",
+                            'processed_at': datetime.now(),
+                            'error': error_msg,
+                            'traceback': traceback.format_exc()
+                        }}
+                    )
                     error_count += 1
                 
                 # Optional: Sleep to prevent hammering the target server
                 time.sleep(0.5)
+        
+        print(f"Processing job completed: {links_processed} links processed, {success_count} successful, {error_count} failed")
         
         # Return stats if we exit the loop
         return {
@@ -613,18 +699,227 @@ def continuous_processing_job(top_level_source_url, stop_event, delay_seconds=18
     except Exception as e:
         print(f"Error in continuous processing job: {str(e)}")
         traceback.print_exc()
+        return {
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }
     finally:
         if client:
             client.close()
+
+def scrape_single_link(db, link_doc, user_id=None):
+    """Helper function to scrape a single link"""
+    print(f"Starting to scrape link: {link_doc.get('link')} for user: {user_id}")
+    
+    link = link_doc['link']
+    is_wiki = 'wikipedia.org' in link or 'wiki' in link.lower()
+    
+    # Get the top-level source and immediate source URLs
+    top_level_source = link_doc.get('top_level_source', link_doc.get('source_url', 'unknown'))
+    source_url = link_doc.get('source_url', 'unknown')
+    
+    # If user_id is not in the link_doc but is passed as a parameter, use the parameter
+    if 'user_id' not in link_doc and user_id:
+        link_doc_user_id = user_id
+        print(f"Using passed user_id: {user_id}")
+    else:
+        link_doc_user_id = link_doc.get('user_id')
+        print(f"Using link_doc user_id: {link_doc_user_id}")
+    
+    # Get collections
+    links_collection = db[LINKS_COLLECTION]
+    content_collection = db[CONTENT_COLLECTION]
+    
+    print(f"Got collection references. Starting to scrape content from {link}")
+    
+    try:
+        # Add user agent to avoid being blocked
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        # Make request to the URL with increased timeout
+        print(f"Making HTTP request to: {link}")
+        try:
+            response = requests.get(link, headers=headers, timeout=60)
+            response.raise_for_status()
+            print(f"HTTP response status: {response.status_code}")
+        except Exception as req_error:
+            print(f"Request error: {str(req_error)}")
+            raise
+        
+        # Parse the HTML content
+        print("Parsing HTML content")
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Get title
+        title = soup.find('title')
+        title_text = title.get_text().strip() if title else "Unknown Title"
+        print(f"Page title: {title_text}")
+        
+        # Extract text based on the site type
+        if is_wiki:
+            print("Wiki page detected, using specialized extraction")
+            # For Wikipedia, focus on the content div
+            content_div = soup.find('div', {'id': 'mw-content-text'})
+            if content_div:
+                # Remove unwanted elements
+                for unwanted in content_div.select('.thumb, .navbox, .infobox, table'):
+                    if unwanted:
+                        unwanted.extract()
+                
+                # Extract text from paragraphs
+                paragraphs = content_div.find_all(['p', 'h2', 'h3', 'h4', 'h5', 'h6'])
+                text_parts = []
+                
+                for p in paragraphs:
+                    text = p.get_text().strip()
+                    if text:
+                        if p.name.startswith('h'):
+                            text_parts.append(f"\n## {text}\n")
+                        else:
+                            text_parts.append(text)
+                
+                text = "\n\n".join(text_parts)
+                text = f"# {title_text}\n\n{text}"
+            else:
+                print("Wiki content div not found, falling back to standard extraction")
+                # Fallback to standard extraction
+                for script in soup(["script", "style"]):
+                    script.extract()
+                text = soup.get_text(separator=' ', strip=True)
+        else:
+            print("Standard page extraction")
+            # Standard extraction for non-Wikipedia sites
+            for script in soup(["script", "style"]):
+                script.extract()
             
+            # Get text and clean it
+            text = soup.get_text(separator=' ', strip=True)
+            
+            # Add title to the beginning
+            text = f"# {title_text}\n\n{text}"
+        
+        # Remove excessive whitespace
+        text = re.sub(r'\n\s*\n', '\n\n', text)
+        print(f"Extracted text length: {len(text)} characters")
+        
+        # Create document for scraped content
+        print("Creating content document")
+        content_document = {
+            'scrapped_content': text,
+            'content_link': link,
+            'scrape_date': datetime.now(),
+            'link_id': link_doc['_id'],
+            'source_url': source_url,  # Immediate parent URL
+            'top_level_source': top_level_source,  # Original source URL
+            'depth': link_doc.get('depth', 0),
+            'title': title_text,
+            'user_id': link_doc_user_id  # Add user_id to associate with specific user
+        }
+        
+        # Check if content already exists to avoid duplicates
+        existing_content = content_collection.find_one({
+            'content_link': link,
+            'user_id': link_doc_user_id
+        })
+        
+        if existing_content:
+            print(f"Content already exists for {link}, skipping insertion")
+            content_id = existing_content['_id']
+        else:
+            # Insert into content collection - don't use lock
+            print(f"Inserting content into database for {link}")
+            try:
+                result = content_collection.insert_one(content_document)
+                content_id = result.inserted_id
+                print(f"Content inserted with ID: {content_id}")
+                
+                # Verify the document was inserted
+                inserted_doc = content_collection.find_one({'_id': content_id})
+                if inserted_doc:
+                    print(f"Content document insertion verified")
+                else:
+                    print(f"Warning: Could not verify content document insertion")
+            except Exception as db_error:
+                print(f"Database error inserting content: {str(db_error)}")
+                traceback.print_exc()
+                raise
+        
+        # Update the link as processed - don't use lock
+        print(f"Updating link status to processed for {link}")
+        try:
+            update_result = links_collection.update_one(
+                {'_id': link_doc['_id']},
+                {'$set': {
+                    'is_processed': True,  # Successfully processed
+                    'processed_at': datetime.now(),
+                    'top_level_source': top_level_source
+                }}
+            )
+            print(f"Link status update result: {update_result.modified_count} document(s) modified")
+            
+            # Verify update
+            updated_link = links_collection.find_one({'_id': link_doc['_id']})
+            if updated_link and updated_link.get('is_processed') is True:
+                print(f"Link status update verified")
+            else:
+                print(f"Warning: Could not verify link status update")
+        except Exception as update_error:
+            print(f"Database error updating link status: {str(update_error)}")
+            traceback.print_exc()
+            raise
+        
+        print(f"Successfully processed {link}")
+        return {
+            'status': 'success',
+            'link': link,
+            'content_length': len(text),
+            'title': title_text,
+            'content_id': str(content_id),
+            'top_level_source': top_level_source,
+            'source_url': source_url
+        }
+    
+    except requests.exceptions.RequestException as e:
+        error_msg = f"Request error: {str(e)}"
+        print(f"Failed to scrape {link}: {error_msg}")
+        traceback.print_exc()
+        
+        # Do not update is_processed here, let the calling function handle it
+        return {
+            'status': 'error',
+            'link': link,
+            'error': error_msg,
+            'top_level_source': top_level_source
+        }
+    
+    except Exception as e:
+        error_msg = f"Processing error: {str(e)}"
+        tb = traceback.format_exc()
+        print(f"Failed to scrape {link}: {error_msg}")
+        print(tb)
+        
+        # Do not update is_processed here, let the calling function handle it
+        return {
+            'status': 'error',
+            'link': link,
+            'error': error_msg,
+            'traceback': tb,
+            'top_level_source': top_level_source
+        }
+
 @file_api.route('/recursive-crawl', methods=['POST'])
-def recursive_crawl():
+@token_required
+def recursive_crawl(user_id):
     """
     Start a background thread to continuously crawl pages from Links_to_scrap collection.
     This function will immediately return and the crawling will continue in the background.
     """
     client = None
     try:
+        print(f"Starting recursive crawl for user ID: {user_id}")  # Debug print
+        
         # Get MongoDB client
         client = get_mongo_client()
         db = client[DB_NAME]
@@ -635,7 +930,10 @@ def recursive_crawl():
         
         # Get the URL from the request body
         data = request.get_json()
+        print(f"Request data: {data}")  # Debug print
+        
         if not data or 'url' not in data:
+            print("URL is missing in request body")  # Debug print
             return jsonify({
                 'status': 'error',
                 'message': 'URL is required in the POST body.',
@@ -644,17 +942,21 @@ def recursive_crawl():
         
         # Get the top-level source URL provided by the user
         top_level_source_url = data['url']
+        print(f"Top level source URL: {top_level_source_url}")  # Debug print
         
         # Validate URL format
         if not is_valid_url(top_level_source_url):
+            print(f"Invalid URL format: {top_level_source_url}")  # Debug print
             return jsonify({
                 'status': 'error',
                 'message': f'Invalid URL format: {top_level_source_url}',
                 'timestamp': datetime.now().isoformat()
             }), 400
         
-        # Check if already crawling this URL
-        if top_level_source_url in crawling_events and not crawling_events[top_level_source_url].is_set():
+        # Check if already crawling this URL for this user
+        crawl_key = f"{user_id}:{top_level_source_url}"
+        if crawl_key in crawling_events and not crawling_events[crawl_key].is_set():
+            print(f"Crawling already in progress for: {crawl_key}")  # Debug print
             return jsonify({
                 'status': 'info',
                 'message': f'Crawling for {top_level_source_url} is already in progress.',
@@ -663,15 +965,20 @@ def recursive_crawl():
         
         # Check if the URL has already been crawled completely
         links_count = links_collection.count_documents({
-            'top_level_source': top_level_source_url
+            'top_level_source': top_level_source_url,
+            'user_id': user_id
         })
         
         uncrawled_count = links_collection.count_documents({
             'top_level_source': top_level_source_url,
-            'is_crawled': False
+            'is_crawled': False,
+            'user_id': user_id
         })
         
+        print(f"Found {links_count} total links and {uncrawled_count} uncrawled links")  # Debug print
+        
         if links_count > 0 and uncrawled_count == 0:
+            print(f"URL already completely crawled: {top_level_source_url}")  # Debug print
             return jsonify({
                 'status': 'info',
                 'message': f'URL {top_level_source_url} has already been completely crawled.',
@@ -681,38 +988,101 @@ def recursive_crawl():
                 'timestamp': datetime.now().isoformat()
             })
         
-        # Check if the URL exists in Links_to_scrap (i.e., crawling has started but not completed)
-        existing_link = links_collection.find_one({'link': top_level_source_url})
+        # Check if the URL exists in Links_to_scrap
+        existing_link = links_collection.find_one({
+            'link': top_level_source_url,
+            'user_id': user_id
+        })
+        
+        print(f"Existing link found: {existing_link is not None}")  # Debug print
         
         # If the URL is not in Links_to_scrap, add it as a new starting point
         if not existing_link:
-            with mongo_lock:
-                links_collection.insert_one({
+            try:
+                print(f"Inserting initial URL to Links_to_scrap: {top_level_source_url}")  # Debug print
+                insert_doc = {
                     'link': top_level_source_url,
                     'added_at': datetime.now(),
                     'is_crawled': False,
-                    'is_processed': False,  # New field to track processing status
-                    'depth': 0,  # Starting URL is depth 0
-                    'source_url': top_level_source_url,  # Set the source URL as itself for the starting URL
-                    'top_level_source': top_level_source_url  # Track the top-level source URL
-                })
-                print(f"Initial URL added to Links_to_scrap: {top_level_source_url}")
+                    'is_processed': False,
+                    'depth': 0,
+                    'source_url': top_level_source_url,
+                    'top_level_source': top_level_source_url,
+                    'user_id': user_id  # Associate with specific user
+                }
+                
+                # Use update_one with upsert instead of insert_one to prevent duplicates
+                insert_result = links_collection.update_one(
+                    {'link': top_level_source_url, 'user_id': user_id},
+                    {'$setOnInsert': insert_doc},
+                    upsert=True
+                )
+                
+                print(f"Insert result: {insert_result.upserted_id or 'Already exists'}")  # Debug print
+                
+                # Verify the document was inserted
+                inserted_doc = links_collection.find_one({'link': top_level_source_url, 'user_id': user_id})
+                print(f"Inserted document verification: {inserted_doc is not None}")
+                if inserted_doc:
+                    print(f"Document found with ID: {inserted_doc.get('_id')}")
+            except Exception as e:
+                print(f"Error inserting URL: {str(e)}")  # Debug print
+                traceback.print_exc()
+                raise
         
-        # Save the source URL and timestamp in the new collection
-        with mongo_lock:
-            source_urls_collection.insert_one({
+        # Save the source URL and timestamp in the Source_Urls collection
+        try:
+            print(f"Inserting source URL to Source_Urls collection: {top_level_source_url}")  # Debug print
+            # Create source document without timestamp field
+            source_doc = {
                 'source_url': top_level_source_url,
-                'timestamp': datetime.now()
+                'user_id': user_id  # Associate with specific user
+            }
+            
+            # First try to find if the document already exists
+            existing_source = source_urls_collection.find_one({
+                'source_url': top_level_source_url,
+                'user_id': user_id
             })
+            
+            if existing_source:
+                # If exists, just update the timestamp
+                source_urls_collection.update_one(
+                    {'_id': existing_source['_id']},
+                    {'$set': {'timestamp': datetime.now()}}
+                )
+                print(f"Updated timestamp for existing source URL record")
+            else:
+                # If not exists, create new with timestamp
+                source_doc['timestamp'] = datetime.now()
+                source_result = source_urls_collection.insert_one(source_doc)
+                print(f"Source URL insert result: {source_result.inserted_id}")
+                
+        except Exception as e:
+            print(f"Error inserting source URL: {str(e)}")  # Debug print
+            traceback.print_exc()
+            raise
         
         # Create a new stop event for this crawl job
         stop_event = Event()
-        crawling_events[top_level_source_url] = stop_event
+        crawling_events[crawl_key] = stop_event
+        
+        print(f"Starting crawler thread for {top_level_source_url}")  # Debug print
+        
+        # Define a wrapper function to start the crawling
+        def start_crawl(url, stop_event, user_id):
+            try:
+                print(f"Starting crawl thread for {url}, user: {user_id}")
+                result = continuous_crawl_job(url, stop_event, user_id)
+                print(f"Crawling completed with result: {result}")
+            except Exception as e:
+                print(f"Error in crawl thread: {e}")
+                traceback.print_exc()
         
         # Start the crawling in a background thread
         crawler_thread = Thread(
-            target=continuous_crawl_job,
-            args=(top_level_source_url, stop_event),
+            target=start_crawl,
+            args=(top_level_source_url, stop_event, user_id),
             daemon=True
         )
         crawler_thread.start()
@@ -738,7 +1108,8 @@ def recursive_crawl():
             client.close()
             
 @file_api.route('/process-all-links', methods=['POST'])
-def process_all_links():
+@token_required
+def process_all_links(user_id):
     """
     Start a background thread to continuously process all links in the Links_to_scrap collection
     until all links are processed (is_processed: true).
@@ -746,20 +1117,27 @@ def process_all_links():
     """
     client = None
     try:
+        print(f"Starting process_all_links for user ID: {user_id}")
+        
         # Get the delay parameter (default: 3 minutes = 180 seconds)
         data = request.get_json() or {}
         delay_seconds = data.get('delay', 180)
         source_url = data.get('source_url')
         
+        print(f"Request data: delay={delay_seconds}, source_url={source_url}")
+        
         if not source_url:
+            print("source_url is missing in request body")
             return jsonify({
                 'status': 'error',
                 'message': 'source_url is required in the POST body.',
                 'timestamp': datetime.now().isoformat()
             }), 400
             
-        # Check if already processing this URL
-        if source_url in processing_events and not processing_events[source_url].is_set():
+        # Check if already processing this URL for this user
+        process_key = f"{user_id}:{source_url}"
+        if process_key in processing_events and not processing_events[process_key].is_set():
+            print(f"Processing already in progress for: {process_key}")
             return jsonify({
                 'status': 'info',
                 'message': f'Processing for {source_url} is already in progress.',
@@ -773,13 +1151,17 @@ def process_all_links():
         # Get collections
         links_collection = db[LINKS_COLLECTION]
         
-        # Check how many unprocessed links exist
+        # Check how many unprocessed links exist for this user
         unprocessed_count = links_collection.count_documents({
             'is_processed': False,
-            'top_level_source': source_url
+            'top_level_source': source_url,
+            'user_id': user_id
         })
         
+        print(f"Found {unprocessed_count} unprocessed links for source: {source_url}, user: {user_id}")
+        
         if unprocessed_count == 0:
+            print(f"No unprocessed links found for {source_url}")
             return jsonify({
                 'status': 'complete',
                 'message': f'No unprocessed links found for {source_url}',
@@ -788,15 +1170,26 @@ def process_all_links():
         
         # Create a new stop event for this processing job
         stop_event = Event()
-        processing_events[source_url] = stop_event
+        processing_events[process_key] = stop_event
+        
+        # Define a wrapper function to start the processing
+        def start_processing(source_url, stop_event, delay_seconds, user_id):
+            try:
+                print(f"Starting processing thread for {source_url}, user: {user_id}, delay: {delay_seconds}s")
+                result = continuous_processing_job(source_url, stop_event, delay_seconds, user_id)
+                print(f"Processing completed with result: {result}")
+            except Exception as e:
+                print(f"Error in processing thread: {e}")
+                traceback.print_exc()
         
         # Start the processing in a background thread with the specified delay
         processor_thread = Thread(
-            target=continuous_processing_job,
-            args=(source_url, stop_event, delay_seconds),
+            target=start_processing,
+            args=(source_url, stop_event, delay_seconds, user_id),
             daemon=True
         )
         processor_thread.start()
+        print(f"Processing thread started for {source_url}")
         
         return jsonify({
             'status': 'success',
@@ -820,10 +1213,13 @@ def process_all_links():
             client.close()
 
 @file_api.route('/source-url-status', methods=['GET'])
-def get_source_url_status():
-    """Get the status of a specific source URL"""
+@token_required
+def get_source_url_status(user_id):
+    """Get the status of a specific source URL for the authenticated user"""
     client = None
     try:
+        print(f"Getting source URL status for user: {user_id}")
+        
         client = get_mongo_client()
         db = client[DB_NAME]
         links_collection = db[LINKS_COLLECTION]
@@ -831,22 +1227,41 @@ def get_source_url_status():
         
         source_url = request.args.get('source_url')
         if not source_url:
+            print("source_url parameter is missing")
             return jsonify({
                 'status': 'error',
                 'message': 'source_url is required.',
                 'timestamp': datetime.now().isoformat()
             }), 400
         
-        # Count total URLs associated with this source in Links_to_scrap collection
-        total_urls = links_collection.count_documents({'top_level_source': source_url})
+        print(f"Checking status for source URL: {source_url}")
+        
+        # Count total URLs associated with this source for this user
+        total_urls = links_collection.count_documents({
+            'top_level_source': source_url,
+            'user_id': user_id
+        })
         
         # Count processed URLs for this source (both successful and failed)
-        successful_processed = links_collection.count_documents({'top_level_source': source_url, 'is_processed': True})
-        failed_processed = links_collection.count_documents({'top_level_source': source_url, 'is_processed': "Failed"})
+        successful_processed = links_collection.count_documents({
+            'top_level_source': source_url, 
+            'is_processed': True,
+            'user_id': user_id
+        })
+        failed_processed = links_collection.count_documents({
+            'top_level_source': source_url, 
+            'is_processed': "Failed",
+            'user_id': user_id
+        })
         total_processed = successful_processed + failed_processed
         
         # Count scraped URLs for this source
-        total_scrapped = content_collection.count_documents({'top_level_source': source_url})
+        total_scrapped = content_collection.count_documents({
+            'top_level_source': source_url,
+            'user_id': user_id
+        })
+        
+        print(f"Stats: Total URLs: {total_urls}, Successful: {successful_processed}, Failed: {failed_processed}, Total Processed: {total_processed}, Scrapped: {total_scrapped}")
         
         # Determine the status
         if total_urls == 0:
@@ -859,7 +1274,7 @@ def get_source_url_status():
             # Otherwise, it's still pending
             status = 'Pending'
         
-        print(f"Source: {source_url}, Total URLs: {total_urls}, Successful: {successful_processed}, Failed: {failed_processed}, Total Processed: {total_processed}, Scrapped: {total_scrapped}, Status: {status}")
+        print(f"Source status determined as: {status}")
         
         return jsonify({
             'status': 'success',
@@ -875,6 +1290,8 @@ def get_source_url_status():
             'timestamp': datetime.now().isoformat()
         })
     except Exception as e:
+        print(f"Error getting source URL status: {str(e)}")
+        traceback.print_exc()
         return jsonify({
             'status': 'error',
             'message': str(e),
@@ -884,13 +1301,17 @@ def get_source_url_status():
     finally:
         if client:
             client.close()
-            
+
 @file_api.route('/stop-crawling', methods=['POST'])
-def stop_crawling():
+@token_required
+def stop_crawling(user_id):
     """Stop the continuous crawling for a specific source URL"""
     try:
+        print(f"Request to stop crawling for user: {user_id}")
+        
         data = request.get_json()
         if not data or 'source_url' not in data:
+            print("source_url is missing in request body")
             return jsonify({
                 'status': 'error',
                 'message': 'source_url is required in the POST body.',
@@ -898,15 +1319,21 @@ def stop_crawling():
             }), 400
             
         source_url = data['source_url']
+        print(f"Stopping crawling for source URL: {source_url}")
         
-        if source_url in crawling_events:
-            crawling_events[source_url].set()
+        # Create user-specific key
+        crawl_key = f"{user_id}:{source_url}"
+        
+        if crawl_key in crawling_events:
+            print(f"Found crawling job for {crawl_key}, setting stop event")
+            crawling_events[crawl_key].set()
             return jsonify({
                 'status': 'success',
                 'message': f'Crawling for {source_url} has been stopped.',
                 'timestamp': datetime.now().isoformat()
             })
         else:
+            print(f"No active crawling found for {crawl_key}")
             return jsonify({
                 'status': 'error',
                 'message': f'No active crawling found for {source_url}',
@@ -914,6 +1341,8 @@ def stop_crawling():
             }), 404
             
     except Exception as e:
+        print(f"Error stopping crawling: {str(e)}")
+        traceback.print_exc()
         return jsonify({
             'status': 'error',
             'message': str(e),
@@ -922,11 +1351,15 @@ def stop_crawling():
         }), 500
 
 @file_api.route('/stop-processing', methods=['POST'])
-def stop_processing():
+@token_required
+def stop_processing_job(user_id):  # Renamed to avoid conflicts
     """Stop the continuous processing for a specific source URL"""
     try:
+        print(f"Request to stop processing for user: {user_id}")
+        
         data = request.get_json()
         if not data or 'source_url' not in data:
+            print("source_url is missing in request body")
             return jsonify({
                 'status': 'error',
                 'message': 'source_url is required in the POST body.',
@@ -934,15 +1367,21 @@ def stop_processing():
             }), 400
             
         source_url = data['source_url']
+        print(f"Stopping processing for source URL: {source_url}")
         
-        if source_url in processing_events:
-            processing_events[source_url].set()
+        # Create user-specific key
+        process_key = f"{user_id}:{source_url}"
+        
+        if process_key in processing_events:
+            print(f"Found processing job for {process_key}, setting stop event")
+            processing_events[process_key].set()
             return jsonify({
                 'status': 'success',
                 'message': f'Processing for {source_url} has been stopped.',
                 'timestamp': datetime.now().isoformat()
             })
         else:
+            print(f"No active processing found for {process_key}")
             return jsonify({
                 'status': 'error',
                 'message': f'No active processing found for {source_url}',
@@ -950,6 +1389,8 @@ def stop_processing():
             }), 404
             
     except Exception as e:
+        print(f"Error stopping processing: {str(e)}")
+        traceback.print_exc()
         return jsonify({
             'status': 'error',
             'message': str(e),
@@ -957,145 +1398,10 @@ def stop_processing():
             'timestamp': datetime.now().isoformat()
         }), 500
 
-def scrape_single_link(db, link_doc):
-    """Helper function to scrape a single link"""
-    link = link_doc['link']
-    is_wiki = 'wikipedia.org' in link or 'wiki' in link.lower()
-    
-    # Get the top-level source and immediate source URLs
-    top_level_source = link_doc.get('top_level_source', link_doc.get('source_url', 'unknown'))
-    source_url = link_doc.get('source_url', 'unknown')
-    
-    # Get collections
-    links_collection = db[LINKS_COLLECTION]
-    content_collection = db[CONTENT_COLLECTION]
-    
-    try:
-        # Add user agent to avoid being blocked
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        
-        # Make request to the URL with increased timeout
-        response = requests.get(link, headers=headers, timeout=60)
-        response.raise_for_status()
-        
-        # Parse the HTML content
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Get title
-        title = soup.find('title')
-        title_text = title.get_text().strip() if title else "Unknown Title"
-        
-        # Extract text based on the site type
-        if is_wiki:
-            # For Wikipedia, focus on the content div
-            content_div = soup.find('div', {'id': 'mw-content-text'})
-            if content_div:
-                # Remove unwanted elements
-                for unwanted in content_div.select('.thumb, .navbox, .infobox, table'):
-                    if unwanted:
-                        unwanted.extract()
-                
-                # Extract text from paragraphs
-                paragraphs = content_div.find_all(['p', 'h2', 'h3', 'h4', 'h5', 'h6'])
-                text_parts = []
-                
-                for p in paragraphs:
-                    text = p.get_text().strip()
-                    if text:
-                        if p.name.startswith('h'):
-                            text_parts.append(f"\n## {text}\n")
-                        else:
-                            text_parts.append(text)
-                
-                text = "\n\n".join(text_parts)
-                text = f"# {title_text}\n\n{text}"
-            else:
-                # Fallback to standard extraction
-                for script in soup(["script", "style"]):
-                    script.extract()
-                text = soup.get_text(separator=' ', strip=True)
-        else:
-            # Standard extraction for non-Wikipedia sites
-            for script in soup(["script", "style"]):
-                script.extract()
-            
-            # Get text and clean it
-            text = soup.get_text(separator=' ', strip=True)
-            
-            # Add title to the beginning
-            text = f"# {title_text}\n\n{text}"
-        
-        # Remove excessive whitespace
-        text = re.sub(r'\n\s*\n', '\n\n', text)
-        
-        # Create document for scraped content
-        content_document = {
-            'scrapped_content': text,
-            'content_link': link,
-            'scrape_date': datetime.now(),
-            'link_id': link_doc['_id'],
-            'source_url': source_url,  # Immediate parent URL
-            'top_level_source': top_level_source,  # Original source URL
-            'depth': link_doc.get('depth', 0),
-            'title': title_text
-        }
-        
-        # Insert into content collection
-        result = content_collection.insert_one(content_document)
-        
-        # Update the link as processed
-        links_collection.update_one(
-            {'_id': link_doc['_id']},
-            {'$set': {
-                'is_processed': True,  # Successfully processed
-                'processed_at': datetime.now(),
-                'top_level_source': top_level_source
-            }}
-        )
-        
-        return {
-            'status': 'success',
-            'link': link,
-            'content_length': len(text),
-            'title': title_text,
-            'content_id': str(result.inserted_id),
-            'top_level_source': top_level_source,
-            'source_url': source_url
-        }
-    
-    except requests.exceptions.RequestException as e:
-        error_msg = f"Request error: {str(e)}"
-        print(f"Failed to scrape {link}: {error_msg}")
-        
-        # Do not update is_processed here, let the calling function handle it
-        return {
-            'status': 'error',
-            'link': link,
-            'error': error_msg,
-            'top_level_source': top_level_source
-        }
-    
-    except Exception as e:
-        error_msg = f"Processing error: {str(e)}"
-        tb = traceback.format_exc()
-        print(f"Failed to scrape {link}: {error_msg}")
-        
-        # Do not update is_processed here, let the calling function handle it
-        return {
-            'status': 'error',
-            'link': link,
-            'error': error_msg,
-            'traceback': tb,
-            'top_level_source': top_level_source
-        }
-    
-# Modified API endpoints to filter by source URL
-
 @file_api.route('/realtime-stats/links-to-scrap', methods=['GET'])
-def get_links_to_scrap():
-    """Get all links in the Links_to_scrap collection, filtered by source URL"""
+@token_required
+def get_links_to_scrap(user_id):
+    """Get all links in the Links_to_scrap collection, filtered by source URL for the current user"""
     client = None
     try:
         client = get_mongo_client()
@@ -1103,7 +1409,7 @@ def get_links_to_scrap():
         links_to_scrap_collection = db[LINKS_COLLECTION]
         
         source_url = request.args.get('source_url')
-        query = {'top_level_source': source_url} if source_url else {}
+        query = {'top_level_source': source_url, 'user_id': user_id} if source_url else {'user_id': user_id}
         
         links_to_scrap = list(links_to_scrap_collection.find(query, {'link': 1, 'top_level_source': 1, '_id': 0}))
         
@@ -1125,8 +1431,9 @@ def get_links_to_scrap():
             client.close()
 
 @file_api.route('/realtime-stats/total-processed-links', methods=['GET'])
-def get_total_processed_links():
-    """Get the total number of processed links, filtered by source URL"""
+@token_required
+def get_total_processed_links(user_id):
+    """Get the total number of processed links, filtered by source URL for the current user"""
     client = None
     try:
         client = get_mongo_client()
@@ -1134,7 +1441,10 @@ def get_total_processed_links():
         links_collection = db[LINKS_COLLECTION]
         
         source_url = request.args.get('source_url')
-        query = {'top_level_source': source_url, 'is_processed': True} if source_url else {'is_processed': True}
+        if source_url:
+            query = {'top_level_source': source_url, 'is_processed': True, 'user_id': user_id}
+        else:
+            query = {'is_processed': True, 'user_id': user_id}
         
         total_processed_links = links_collection.count_documents(query)
         
@@ -1156,8 +1466,9 @@ def get_total_processed_links():
             client.close()
 
 @file_api.route('/realtime-stats/scrapped-links', methods=['GET'])
-def get_scrapped_links():
-    """Get the number of scrapped links, filtered by source URL"""
+@token_required
+def get_scrapped_links(user_id):
+    """Get the number of scrapped links, filtered by source URL for the current user"""
     client = None
     try:
         client = get_mongo_client()
@@ -1165,7 +1476,10 @@ def get_scrapped_links():
         scrapped_text_collection = db[CONTENT_COLLECTION]
         
         source_url = request.args.get('source_url')
-        query = {'top_level_source': source_url} if source_url else {}
+        if source_url:
+            query = {'top_level_source': source_url, 'user_id': user_id}
+        else:
+            query = {'user_id': user_id}
         
         scrapped_links_count = scrapped_text_collection.count_documents(query)
         
@@ -1187,8 +1501,9 @@ def get_scrapped_links():
             client.close()
 
 @file_api.route('/realtime-stats/pending-links', methods=['GET'])
-def get_pending_links():
-    """Get the number of pending links, filtered by source URL"""
+@token_required
+def get_pending_links(user_id):
+    """Get the number of pending links, filtered by source URL for the current user"""
     client = None
     try:
         client = get_mongo_client()
@@ -1196,7 +1511,10 @@ def get_pending_links():
         links_collection = db[LINKS_COLLECTION]
         
         source_url = request.args.get('source_url')
-        query = {'top_level_source': source_url, 'is_processed': False} if source_url else {'is_processed': False}
+        if source_url:
+            query = {'top_level_source': source_url, 'is_processed': False, 'user_id': user_id}
+        else:
+            query = {'is_processed': False, 'user_id': user_id}
         
         pending_links = links_collection.count_documents(query)
         
@@ -1218,8 +1536,9 @@ def get_pending_links():
             client.close()
 
 @file_api.route('/realtime-stats/total-words-scrapped', methods=['GET'])
-def get_total_words_scrapped():
-    """Get the total number of words scraped, filtered by source URL"""
+@token_required
+def get_total_words_scrapped(user_id):
+    """Get the total number of words scraped, filtered by source URL for the current user"""
     client = None
     try:
         client = get_mongo_client()
@@ -1229,8 +1548,12 @@ def get_total_words_scrapped():
         source_url = request.args.get('source_url')
         pipeline = []
         
+        # Build the match condition based on whether a source_url is provided
+        match_condition = {"user_id": user_id}
         if source_url:
-            pipeline.append({"$match": {"top_level_source": source_url}})
+            match_condition["top_level_source"] = source_url
+            
+        pipeline.append({"$match": match_condition})
         
         pipeline.extend([
             {
@@ -1268,7 +1591,10 @@ def get_total_words_scrapped():
 
 @file_api.route('/scrapped-sub-links', methods=['POST'])
 def scrapped_sub_links():
-    """Fetch the content of links related to a specific source URL"""
+    """
+    Fetch links related to a specific source URL with pagination
+    Returns 10 URLs at a time with their processing status
+    """
     client = None
     try:
         data = request.get_json()
@@ -1280,7 +1606,8 @@ def scrapped_sub_links():
             }), 400
         
         source_url = data.get('source_url')
-        specific_url = data.get('url')
+        page = data.get('page', 1)  # Default to page 1
+        page_size = 10  # Fixed page size of 10 items
         
         if not source_url:
             return jsonify({
@@ -1291,53 +1618,57 @@ def scrapped_sub_links():
         
         client = get_mongo_client()
         db = client[DB_NAME]
-        scrapped_text_collection = db[CONTENT_COLLECTION]
+        links_collection = db[LINKS_COLLECTION]
+        content_collection = db[CONTENT_COLLECTION]
         
-        if specific_url:
-            query = {'content_link': specific_url, 'top_level_source': source_url}
-            document = scrapped_text_collection.find_one(query, {'scrapped_content': 1, 'content_link': 1, 'title': 1, '_id': 0})
+        # Calculate skip value for pagination
+        skip = (page - 1) * page_size
+        
+        # Fetch links for this source
+        query = {'top_level_source': source_url}
+        total_links = links_collection.count_documents(query)
+        
+        # Get paginated links
+        links_cursor = links_collection.find(
+            query, 
+            {'link': 1, 'is_processed': 1, '_id': 0}
+        ).skip(skip).limit(page_size)
+        
+        links_data = []
+        
+        for link_doc in links_cursor:
+            # Determine URL status
+            url_status = "Completed" if link_doc.get('is_processed') is True else "Pending"
             
-            if not document:
-                return jsonify({
-                    'status': 'error',
-                    'message': f'No content found for the URL: {specific_url} with source: {source_url}',
-                    'timestamp': datetime.now().isoformat()
-                }), 404
+            # If is_processed is "Failed", mark as failed
+            if link_doc.get('is_processed') == "Failed":
+                url_status = "Failed"
                 
-            response = {
-                'url': specific_url,
-                'content': document['scrapped_content'],
-                'title': document.get('title', 'Unknown Title')
-            }
-            
-            return jsonify({
-                'status': 'success',
-                'data': response,
-                'timestamp': datetime.now().isoformat()
+            links_data.append({
+                'url': link_doc['link'],
+                'url_status': url_status
             })
-        else:
-            query = {'top_level_source': source_url}
-            documents = list(scrapped_text_collection.find(query, {'scrapped_content': 1, 'content_link': 1, 'title': 1, '_id': 0}))
-            
-            if not documents:
-                return jsonify({
-                    'status': 'error',
-                    'message': f'No content found for source URL: {source_url}',
-                    'timestamp': datetime.now().isoformat()
-                }), 404
-                
-            response = [{
-                'url': doc['content_link'],
-                'title': doc.get('title', 'Unknown Title'),
-                'content_preview': doc['scrapped_content'][:200] + '...' if len(doc['scrapped_content']) > 200 else doc['scrapped_content']
-            } for doc in documents]
-            
-            return jsonify({
-                'status': 'success',
-                'data': response,
-                'source_url': source_url,
-                'timestamp': datetime.now().isoformat()
-            })
+        
+        # Calculate pagination metadata
+        total_pages = (total_links + page_size - 1) // page_size  # Ceiling division
+        has_next = page < total_pages
+        has_prev = page > 1
+        
+        return jsonify({
+            'status': 'success',
+            'data': links_data,
+            'pagination': {
+                'page': page,
+                'page_size': page_size,
+                'total_items': total_links,
+                'total_pages': total_pages,
+                'has_next': has_next,
+                'has_prev': has_prev
+            },
+            'source_url': source_url,
+            'timestamp': datetime.now().isoformat()
+        })
+        
     except Exception as e:
         return jsonify({
             'status': 'error',
@@ -1350,10 +1681,13 @@ def scrapped_sub_links():
             client.close()
 
 @file_api.route('/all-documents', methods=['GET'])
-def get_all_documents():
-    """Get all documents with source_link and status"""
+@token_required
+def get_all_documents(user_id):
+    """Get all documents with source_link and status for the authenticated user"""
     client = None
     try:
+        print(f"Fetching all documents for user: {user_id}")
+        
         client = get_mongo_client()
         db = client[DB_NAME]
         
@@ -1362,57 +1696,41 @@ def get_all_documents():
         links_collection = db[LINKS_COLLECTION]
         content_collection = db[CONTENT_COLLECTION]
         
-        # Fetch all source URLs, sorted by timestamp in descending order (latest first)
-        source_urls = list(source_urls_collection.find().sort('timestamp', -1))
+        # Fetch all source URLs for this user, sorted by timestamp in descending order (latest first)
+        print(f"Querying Source_Urls collection for user: {user_id}")
+        source_urls = list(source_urls_collection.find({'user_id': user_id}).sort('timestamp', -1))
+        
+        print(f"Found {len(source_urls)} source URLs for user: {user_id}")
         
         documents = []
         
         for source_url_doc in source_urls:
             source_url = source_url_doc['source_url']
+            print(f"Processing source URL: {source_url}")
             
-            # Count total URLs for this source
-            total_urls = links_collection.count_documents({
-                'top_level_source': source_url
-            })
-            
-            # Count unprocessed links for this source URL
-            unprocessed_count = links_collection.count_documents({
+            # Count the number of processed links for this source URL
+            processed_count = links_collection.count_documents({
                 'top_level_source': source_url,
-                'is_processed': False
-            })
-            
-            # Count processed links (both successful and failed)
-            successful_processed = links_collection.count_documents({
-                'top_level_source': source_url,
-                'is_processed': True
-            })
-            
-            failed_processed = links_collection.count_documents({
-                'top_level_source': source_url,
-                'is_processed': "Failed"
+                'is_processed': True,
+                'user_id': user_id
             })
             
             # Count the number of scrapped texts for this source URL
             scrapped_count = content_collection.count_documents({
-                'top_level_source': source_url
+                'top_level_source': source_url,
+                'user_id': user_id
             })
             
-            # Determine the status - if there are no unprocessed links, mark as "Completed"
-            if total_urls == 0:
-                status = 'Pending'
-            elif unprocessed_count == 0:
-                status = 'Completed'
-            else:
-                status = 'Pending'
+            print(f"Source URL: {source_url}, Processed: {processed_count}, Scrapped: {scrapped_count}")
+            
+            # Determine the status
+            status = 'Completed' if processed_count > 0 and processed_count == scrapped_count else 'Pending'
             
             # Append the document to the list
             documents.append({
                 'source_link': source_url,
                 'status': status,
-                'total_urls': total_urls,
-                'unprocessed_links': unprocessed_count,
-                'successful_processed': successful_processed,
-                'failed_processed': failed_processed,
+                'processed_links': processed_count,
                 'scrapped_texts': scrapped_count,
                 'last_scrapped': source_url_doc['timestamp'].isoformat()
             })
@@ -1424,6 +1742,8 @@ def get_all_documents():
         })
     
     except Exception as e:
+        print(f"Error fetching all documents: {str(e)}")
+        traceback.print_exc()
         return jsonify({
             'status': 'error',
             'message': str(e),
@@ -1433,3 +1753,86 @@ def get_all_documents():
     finally:
         if client:
             client.close()
+            
+@file_api.route('/discovered-links', methods=['GET'])
+@token_required
+def get_discovered_links(user_id):
+    """Get all unique links discovered for a user, optionally filtered by source URL"""
+    client = None
+    try:
+        client = get_mongo_client()
+        db = client[DB_NAME]
+        links_collection = db[LINKS_COLLECTION]
+        
+        source_url = request.args.get('source_url')
+        
+        # Build query with user_id
+        query = {'user_id': user_id}
+        if source_url:
+            query['top_level_source'] = source_url
+        
+        # Get distinct links
+        discovered_links = links_collection.distinct('link', query)
+        
+        # Count by domain
+        domains = {}
+        for link in discovered_links:
+            try:
+                domain = link.split('//', 1)[1].split('/', 1)[0] if '//' in link else link.split('/', 1)[0]
+                domains[domain] = domains.get(domain, 0) + 1
+            except:
+                continue
+        
+        # Convert to list of dictionaries for response
+        domain_stats = [{'domain': domain, 'count': count} for domain, count in domains.items()]
+        
+        return jsonify({
+            'status': 'success',
+            'total_links': len(discovered_links),
+            'domain_stats': domain_stats,
+            'source_url': source_url,
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e),
+            'traceback': traceback.format_exc(),
+            'timestamp': datetime.now().isoformat()
+        }), 500
+    finally:
+        if client:
+            client.close()
+
+# Helper function to verify collections exist
+def verify_collections():
+    """Verify all required collections exist"""
+    client = None
+    try:
+        print("Verifying MongoDB collections...")
+        client = get_mongo_client()
+        db = client[DB_NAME]
+        
+        print(f"Checking collections in database: {DB_NAME}")
+        collection_names = db.list_collection_names()
+        print(f"Available collections: {collection_names}")
+        
+        # Check if our collections exist
+        required_collections = [SOURCE_COLLECTION, LINKS_COLLECTION, CONTENT_COLLECTION, 'Source_Urls']
+        for coll_name in required_collections:
+            if coll_name not in collection_names:
+                print(f"Warning: Collection {coll_name} does not exist in database")
+            else:
+                print(f"Collection {coll_name} exists")
+                # Count documents in collection
+                count = db[coll_name].count_documents({})
+                print(f"Collection {coll_name} has {count} documents")
+    except Exception as e:
+        print(f"Error verifying collections: {str(e)}")
+        traceback.print_exc()
+    finally:
+        if client:
+            client.close()
+
+# Test MongoDB connection and collection existence on module load
+verify_collections()

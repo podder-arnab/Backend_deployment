@@ -7,6 +7,7 @@ from bson import ObjectId
 import random
 import re
 
+
 import os
 from dotenv import load_dotenv
 
@@ -20,7 +21,7 @@ VERIFICATION_SECRET_KEY=os.getenv('VERIFICATION_SECRET_KEY')
 
 def get_mongo_client():
     client = MongoClient("mongodb+srv://aniruddhamukherjee:7711@cluster1.vialk.mongodb.net/?retryWrites=true&w=majority&appName=Cluster1")
-    return client['scrapper']  # Use 'xyz' as the database name
+    return client['scrapper_authentication']  # Use 'xyz' as the database name
 
 user_api = Blueprint('user_api', __name__)
 
@@ -31,32 +32,56 @@ def register_user():
     username = data.get('username', '').strip()
     email = data.get('email', '').strip()
     password = data.get('password', '').strip()
-   
+
+    # Validate that all fields are provided
     if not all([name, username, email, password]):
         return jsonify({'error': 'All fields are required'}), 400
 
+    # Validate password format (must contain both letters and numbers)
+    if not re.match(r'^(?=.*[A-Za-z])(?=.*\d)[A-Za-z\d]{8,}$', password):
+        return jsonify({'error': 'Password must be a combination of letters and numbers'}), 400
+
     db = get_mongo_client()
 
+    # Check if email already exists
     if db['user-profile'].find_one({'email': email}):
         return jsonify({'error': 'Email already exists'}), 409
 
+    # Check if username already exists
     if db['user-profile'].find_one({'username': username}):
         return jsonify({'error': 'Username already exists'}), 409
 
+    # Hash the password
     hashed_password = generate_password_hash(password)
-    user_id = db['user-profile'].insert_one({
+
+    # Insert the new user into the database
+    user_data = {
         'name': name,
         'username': username,
         'email': email,
         'password': hashed_password,
-        'email_verified': False,
+        'email_verified': True,  # No email verification needed
         'created_at': datetime.datetime.utcnow()
-    }).inserted_id
+    }
 
-    verification_token = jwt.encode({'user_id': str(user_id)}, VERIFICATION_SECRET_KEY, algorithm='HS256')
-    db['email_verifications'].insert_one({'user_id': user_id, 'token': verification_token, 'created_at': datetime.datetime.utcnow()})
-    
-    return jsonify({'message': 'User registered successfully. Please verify your email.', 'verification_token': verification_token}), 201
+    # Insert the user data and get the generated _id
+    user_id = db['user-profile'].insert_one(user_data).inserted_id
+
+    # Generate a JWT token for the new user with user details
+    token = jwt.encode({
+        'user_id': str(user_id),  # Convert ObjectId to string
+        'name': name,
+        'username': username,
+        'email': email,
+        'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+    }, SECRET_KEY, algorithm='HS256')
+
+    # Return success response with the token and user ID
+    return jsonify({
+        'message': 'User registered successfully',
+        'token': token,
+        'user_id': str(user_id)  # Return the user ID as a string
+    }), 201
 
 @user_api.route('/auth/login', methods=['POST'])
 def login_user():
@@ -73,8 +98,17 @@ def login_user():
     if not user or not check_password_hash(user['password'], password):
         return jsonify({'error': 'Invalid email or password'}), 401
 
-    token = jwt.encode({'user_id': str(user['_id']), 'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=1)}, SECRET_KEY, algorithm='HS256')
+    # Generate a JWT token with user details
+    token = jwt.encode({
+        'user_id': str(user['_id']),  # Convert ObjectId to string
+        'name': user['name'],
+        'username': user['username'],
+        'email': user['email'],
+        'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+    }, SECRET_KEY, algorithm='HS256')
+
     return jsonify({'message': 'Login successful', 'token': token}), 200
+
 
 @user_api.route('/auth/logout', methods=['POST'])
 def logout_user():

@@ -2,4 +2,5 @@
 /file/
 /file2/
 /new.py/
-.env
+/.env/
+/__pycache__/
