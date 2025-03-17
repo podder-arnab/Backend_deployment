@@ -1753,7 +1753,228 @@ def get_all_documents(user_id):
     finally:
         if client:
             client.close()
-            
+
+@file_api.route('/progress-bar', methods=['GET'])
+def get_progress_bar():
+    """
+    Get the progress information for crawling and scraping operations
+    to display in a progress bar in the frontend.
+
+    Query Parameters:
+    - source_url: The top-level source URL to track progress for
+
+    Returns:
+    - crawl_progress: Percentage of links that have been crawled
+    - scrape_progress: Percentage of links that have been scraped
+    - crawled_count: Total number of links crawled
+    - total_links: Total number of links found
+    - scraped_count: Total number of links scraped
+    - status: Current status of the operation
+    - change_since_last: Dictionary containing change in progress percentages
+    """
+    client = None
+    try:
+        # Get source URL from query parameters
+        source_url = request.args.get('source_url')
+
+        if not source_url:
+            return jsonify({
+                'status': 'error',
+                'message': 'source_url is required.',
+                'timestamp': datetime.now().isoformat()
+            }), 400
+
+        client = get_mongo_client()
+        db = client[DB_NAME]
+        links_collection = db[LINKS_COLLECTION]
+        content_collection = db[CONTENT_COLLECTION]
+        progress_history_collection = db['Progress_History']
+
+        # Get the last progress record for this source URL
+        last_progress = progress_history_collection.find_one(
+            {'source_url': source_url},
+            sort=[('timestamp', -1)]
+        )
+
+        # Get total links for this source URL
+        total_links = links_collection.count_documents({'top_level_source': source_url})
+
+        # Skip calculation if no links found
+        if total_links == 0:
+            current_time = datetime.now()
+            return jsonify({
+                'status': 'pending',
+                'message': f'No links found for {source_url}',
+                'crawl_progress': 0,
+                'scrape_progress': 0,
+                'crawled_count': 0,
+                'total_links': 0,
+                'scraped_count': 0,
+                'change_since_last': {
+                    'crawl_progress_change': 0,
+                    'scrape_progress_change': 0,
+                    'links_per_minute': 0,
+                    'scrape_per_minute': 0,
+                    'time_since_last': 0,
+                    'estimated_completion_time': None,
+                    'estimated_completion_minutes': None,
+                    'estimated_time_readable': 'Unknown'
+                },
+                'timestamp': current_time.isoformat()
+            })
+
+        # Calculate crawling progress
+        crawled_count = links_collection.count_documents({
+            'top_level_source': source_url,
+            'is_crawled': True
+        })
+
+        crawl_progress = round((crawled_count / total_links) * 100, 1) if total_links > 0 else 0
+
+        # Calculate scraping progress based on is_processed field
+        # Count successfully processed links (not Failed)
+        scraped_count = links_collection.count_documents({
+            'top_level_source': source_url,
+            'is_processed': True
+        })
+
+        scrape_progress = round((scraped_count / total_links) * 100, 1) if total_links > 0 else 0
+
+        # Determine the overall status
+        status = 'completed'
+
+        # If there are still links to be crawled
+        if crawled_count < total_links:
+            status = 'crawling'
+        # If all links are crawled but not all are processed
+        elif scraped_count < total_links:
+            status = 'processing'
+        # If the source URL is in the active crawling or processing lists
+        elif source_url in crawling_events and not crawling_events[source_url].is_set():
+            status = 'crawling'
+        elif source_url in processing_events and not processing_events[source_url].is_set():
+            status = 'processing'
+
+        # Active crawling and processing status check
+        is_crawling_active = source_url in crawling_events and not crawling_events[source_url].is_set()
+        is_processing_active = source_url in processing_events and not processing_events[source_url].is_set()
+
+        # Calculate change in percentages since last check
+        current_timestamp = datetime.now()
+        change_since_last = {
+            'crawl_progress_change': 0,
+            'scrape_progress_change': 0,
+            'links_per_minute': 0,
+            'scrape_per_minute': 0,
+            'time_since_last': 0, # seconds
+            'estimated_completion_time': None,
+            'estimated_completion_minutes': None
+        }
+
+        if last_progress:
+            last_timestamp = last_progress.get('timestamp')
+            time_diff_seconds = (current_timestamp - last_timestamp).total_seconds()
+            time_diff_minutes = time_diff_seconds / 60
+
+            change_since_last['crawl_progress_change'] = round(crawl_progress - last_progress.get('crawl_progress', 0), 1)
+            change_since_last['scrape_progress_change'] = round(scrape_progress - last_progress.get('scrape_progress', 0), 1)
+            change_since_last['time_since_last'] = round(time_diff_seconds, 1)
+
+            # Calculate rates (per minute)
+            if time_diff_minutes > 0:
+                links_diff = crawled_count - last_progress.get('crawled_count', 0)
+                scrape_diff = scraped_count - last_progress.get('scraped_count', 0)
+
+                change_since_last['links_per_minute'] = round(links_diff / time_diff_minutes, 2)
+                change_since_last['scrape_per_minute'] = round(scrape_diff / time_diff_minutes, 2)
+
+            # Calculate estimated completion time
+            links_remaining = total_links - crawled_count
+            scrape_remaining = total_links - scraped_count
+
+            # Estimate time for crawling (if not complete)
+            estimated_minutes_crawl = 0
+            if crawl_progress < 100 and change_since_last['links_per_minute'] > 0:
+                estimated_minutes_crawl = links_remaining / change_since_last['links_per_minute']
+
+            # Estimate time for scraping (if not complete)
+            estimated_minutes_scrape = 0
+            if scrape_progress < 100 and change_since_last['scrape_per_minute'] > 0:
+                estimated_minutes_scrape = scrape_remaining / change_since_last['scrape_per_minute']
+
+            # Total estimated time is the sum of remaining crawl and scrape time
+            total_estimated_minutes = estimated_minutes_crawl + estimated_minutes_scrape
+
+            if total_estimated_minutes > 0:
+                # Format the estimated completion time
+                change_since_last['estimated_completion_minutes'] = round(total_estimated_minutes, 1)
+
+                # Calculate the absolute timestamp for estimated completion
+                estimated_completion_time = current_timestamp + datetime.timedelta(minutes=total_estimated_minutes)
+                change_since_last['estimated_completion_time'] = estimated_completion_time.isoformat()
+
+                # Add human-readable estimate
+                if total_estimated_minutes < 1:
+                    change_since_last['estimated_time_readable'] = "Less than a minute"
+                elif total_estimated_minutes < 60:
+                    change_since_last['estimated_time_readable'] = f"~{round(total_estimated_minutes)} minutes"
+                else:
+                    hours = int(total_estimated_minutes // 60)
+                    minutes = int(total_estimated_minutes % 60)
+                    change_since_last['estimated_time_readable'] = f"~{hours}h {minutes}m"
+
+        # Save current progress to history
+        progress_history_collection.insert_one({
+            'source_url': source_url,
+            'timestamp': current_timestamp,
+            'crawl_progress': crawl_progress,
+            'scrape_progress': scrape_progress,
+            'crawled_count': crawled_count,
+            'scraped_count': scraped_count,
+            'total_links': total_links,
+            'operation_status': status
+        })
+
+        # Limit history records to prevent excessive storage
+        # Keep only the 100 most recent records for each source URL
+        progress_history_collection.create_index([('source_url', 1), ('timestamp', -1)])
+
+        # Delete older records (keep the most recent 100)
+        old_records = progress_history_collection.find(
+            {'source_url': source_url},
+            sort=[('timestamp', -1)],
+            skip=100
+        )
+
+        old_record_ids = [record['_id'] for record in old_records]
+        if old_record_ids:
+            progress_history_collection.delete_many({'_id': {'$in': old_record_ids}})
+
+        return jsonify({
+            'status': 'success',
+            'operation_status': status,
+            'crawl_progress': crawl_progress,
+            'scrape_progress': scrape_progress,
+            'crawled_count': crawled_count,
+            'total_links': total_links,
+            'scraped_count': scraped_count,
+            'is_crawling_active': is_crawling_active,
+            'is_processing_active': is_processing_active,
+            'change_since_last': change_since_last,
+            'timestamp': current_timestamp.isoformat()
+        })
+
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e),
+            'error_details': traceback.format_exc(),
+            'timestamp': datetime.now().isoformat()
+        }), 500
+    finally:
+        if client:
+            client.close()   
+                     
 @file_api.route('/discovered-links', methods=['GET'])
 @token_required
 def get_discovered_links(user_id):
