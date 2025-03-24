@@ -128,6 +128,9 @@ def auth_login_redirect():
         return options_route('')
     return login_user()
 
+
+
+
 @app.route('/auth/register', methods=['POST', 'OPTIONS'])
 def auth_register_redirect():
     if request.method == 'OPTIONS':

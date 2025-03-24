@@ -79,30 +79,30 @@ def initialize_tables():
                 )
             """,
             
-            LINKS_TO_SCRAP_TABLE: """
-                CREATE TABLE {0} (
-                    ALTER TABLE LINKS_TO_SCRAP ADD PROCESSED_AT TIMESTAMP;
-                    ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                    LINK VARCHAR2(2000) NOT NULL,
-                    ADDED_AT TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    IS_CRAWLED NUMBER(1) DEFAULT 0,
-                    IS_PROCESSED VARCHAR2(20) DEFAULT 'false',
-                    SOURCE_URL VARCHAR2(2000),
-                    TOP_LEVEL_SOURCE VARCHAR2(2000),
-                    DEPTH NUMBER DEFAULT 0,
-                    HAS_TEXT_IN_URL NUMBER(1) DEFAULT 0,
-                    USER_ID VARCHAR2(50),
-                    CRAWLING_STARTED TIMESTAMP,
-                    CRAWLED_AT TIMESTAMP,
-                    LINKS_FOUND NUMBER,
-                    LINKS_ADDED NUMBER,
-                    ERROR CLOB,
-                    TRACEBACK CLOB,
-                    SKIPPED NUMBER(1) DEFAULT 0,
-                    SKIP_REASON VARCHAR2(100),
-                    CONSTRAINT UQ_LINK_USER UNIQUE (LINK, USER_ID)
-                )
-            """,
+                LINKS_TO_SCRAP_TABLE: """
+                    CREATE TABLE {0} (
+                        ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                        LINK VARCHAR2(2000) NOT NULL,
+                        ADDED_AT TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        IS_CRAWLED NUMBER(1) DEFAULT 0,
+                        IS_PROCESSED VARCHAR2(20) DEFAULT 'false',
+                        SOURCE_URL VARCHAR2(2000),
+                        TOP_LEVEL_SOURCE VARCHAR2(2000),
+                        DEPTH NUMBER DEFAULT 0,
+                        PROCESSED_AT TIMESTAMP,
+                        HAS_TEXT_IN_URL NUMBER(1) DEFAULT 0,
+                        USER_ID VARCHAR2(50),
+                        CRAWLING_STARTED TIMESTAMP,
+                        CRAWLED_AT TIMESTAMP,
+                        LINKS_FOUND NUMBER,
+                        LINKS_ADDED NUMBER,
+                        ERROR CLOB,
+                        TRACEBACK CLOB,
+                        SKIPPED NUMBER(1) DEFAULT 0,
+                        SKIP_REASON VARCHAR2(100),
+                        CONSTRAINT UQ_LINK_USER UNIQUE (LINK, USER_ID)
+                    )
+                """,
             
             SCRAPPED_TEXT_TABLE: """
                 CREATE TABLE {0} (
@@ -760,6 +760,8 @@ def continuous_crawl_job(top_level_source_url, stop_event, user_id, page_limit=1
     1. All links are processed
     2. stop_event is set
     3. page_limit is reached (number of URLs marked as is_crawled: true)
+    
+    page_limit: Maximum number of pages to crawl (1-5000, 0 means no limit)
     """
     connection = None
     cursor = None
@@ -807,67 +809,175 @@ def continuous_crawl_job(top_level_source_url, stop_event, user_id, page_limit=1
             print(f"Page limit is set to {page_limit} crawled pages")
         
         while not stop_event.is_set():
-            connection = get_oracle_connection()
-            cursor = connection.cursor()
-            
-            # CRITICAL: Check how many URLs have already been crawled for this user and source
-            cursor.execute("""
-                SELECT COUNT(*) FROM {0}
-                WHERE IS_CRAWLED = 1 AND TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
-            """.format(LINKS_TO_SCRAP_TABLE), source_url=top_level_source_url, user_id=user_id)
-            
-            already_crawled_count = cursor.fetchone()[0]
-            
-            # Check if we've reached the page limit
-            if page_limit > 0 and already_crawled_count >= page_limit:
-                print(f"REACHED PAGE LIMIT: {already_crawled_count}/{page_limit} pages crawled. Enforcing limit.")
-                break
-                
-            # Find out how many uncrawled links remain
-            cursor.execute("""
-                SELECT COUNT(*) FROM {0}
-                WHERE (IS_CRAWLED = 0 OR IS_CRAWLED IS NULL) AND TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
-            """.format(LINKS_TO_SCRAP_TABLE), source_url=top_level_source_url, user_id=user_id)
-            
-            links_remaining = cursor.fetchone()[0]
-            
-            # If no uncrawled links remain, we're done
-            if links_remaining == 0:
-                print(f"No more uncrawled links for {top_level_source_url} for user {user_id}. Exiting crawl job.")
-                break
-
-            # Find the next uncrawled link
-            cursor.execute("""
-                SELECT ID, LINK, DEPTH FROM {0}
-                WHERE (IS_CRAWLED = 0 OR IS_CRAWLED IS NULL) AND TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
-                ORDER BY DEPTH ASC, ADDED_AT ASC
-                FETCH FIRST 1 ROW ONLY
-            """.format(LINKS_TO_SCRAP_TABLE), source_url=top_level_source_url, user_id=user_id)
-            
-            link_row = cursor.fetchone()
-            
-            if not link_row:
-                print(f"No more uncrawled links for {top_level_source_url} for user {user_id}. Exiting crawl job.")
-                break
-                
-            link_id, url_to_crawl, current_depth = link_row
-            
-            # Mark the link as being crawled
-            cursor.execute("""
-                UPDATE {0} SET CRAWLING_STARTED = CURRENT_TIMESTAMP
-                WHERE ID = :id
-            """.format(LINKS_TO_SCRAP_TABLE), id=link_id)
-            
-            connection.commit()
-            
-            # Process the URL - request, parse, extract links
-            print(f"Starting to crawl URL: {url_to_crawl} for user {user_id}")
-            
             try:
-                # Request and parse the URL
-                # Extract valid links
+                connection = get_oracle_connection()
+                cursor = connection.cursor()
                 
-                # After processing, update the database
+                # CRITICAL: Check how many URLs have already been crawled for this user and source
+                cursor.execute("""
+                    SELECT COUNT(*) FROM {0}
+                    WHERE IS_CRAWLED = 1 AND TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
+                """.format(LINKS_TO_SCRAP_TABLE), source_url=top_level_source_url, user_id=user_id)
+                
+                already_crawled_count = cursor.fetchone()[0]
+                
+                # Check if we've reached the page limit
+                if page_limit > 0 and already_crawled_count >= page_limit:
+                    print(f"REACHED PAGE LIMIT: {already_crawled_count}/{page_limit} pages crawled. Strictly enforcing limit.")
+                    break
+                    
+                # Find out how many uncrawled links remain
+                cursor.execute("""
+                    SELECT COUNT(*) FROM {0}
+                    WHERE (IS_CRAWLED = 0 OR IS_CRAWLED IS NULL) 
+                    AND TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
+                """.format(LINKS_TO_SCRAP_TABLE), source_url=top_level_source_url, user_id=user_id)
+                
+                links_remaining = cursor.fetchone()[0]
+                
+                # If no uncrawled links remain, we're done
+                if links_remaining == 0:
+                    print(f"No more uncrawled links for {top_level_source_url} for user {user_id}. Exiting crawl job.")
+                    break
+                
+                # Find the next uncrawled link
+                cursor.execute("""
+                    SELECT ID, LINK, NVL(DEPTH, 0) AS DEPTH 
+                    FROM {0}
+                    WHERE (IS_CRAWLED = 0 OR IS_CRAWLED IS NULL)
+                    AND TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
+                    ORDER BY DEPTH ASC, ADDED_AT ASC
+                    FETCH FIRST 1 ROW ONLY
+                """.format(LINKS_TO_SCRAP_TABLE), source_url=top_level_source_url, user_id=user_id)
+                
+                link_row = cursor.fetchone()
+                
+                if not link_row:
+                    print(f"No more uncrawled links for {top_level_source_url} for user {user_id}. Exiting crawl job.")
+                    break
+                    
+                link_id, url_to_crawl, current_depth = link_row
+                
+                # Mark the link as being crawled
+                cursor.execute("""
+                    UPDATE {0} SET CRAWLING_STARTED = CURRENT_TIMESTAMP
+                    WHERE ID = :id
+                """.format(LINKS_TO_SCRAP_TABLE), id=link_id)
+                
+                connection.commit()
+                
+                # Add user agent to avoid being blocked
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                }
+                
+                # Make request to the URL
+                print(f"Making HTTP request to: {url_to_crawl}")
+                response = requests.get(url_to_crawl, headers=headers, timeout=30)
+                response.raise_for_status()
+                
+                # Parse the HTML content
+                print(f"Parsing HTML content from: {url_to_crawl}")
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # Find all anchor tags
+                all_links = soup.find_all('a', href=True)
+                
+                # Base URL for resolving relative URLs
+                base_url = url_to_crawl
+                
+                # Check if the HTML has a base tag
+                base_tag = soup.find('base', href=True)
+                if base_tag:
+                    base_url = base_tag['href']
+                
+                # Extract URLs
+                unique_links = []
+                current_links_added = 0
+                
+                for link in all_links:
+                    href = link['href'].strip()
+                    
+                    # Skip empty hrefs, javascript:, mailto:, tel: links
+                    if not href or href.startswith(('javascript:', 'mailto:', 'tel:', '#')):
+                        continue
+                    
+                    try:
+                        # Convert relative URLs to absolute URLs
+                        full_url = urljoin(base_url, href)
+                        
+                        # Check if the URL belongs to the same domain
+                        link_domain = extract_domain(full_url)
+                        if link_domain != original_domain:
+                            continue
+                        
+                        # Skip invalid URLs, non-content URLs, and social media URLs
+                        if not is_valid_url(full_url) or not is_valid_content_url(full_url) or is_social_media_url(full_url):
+                            continue
+                        
+                        unique_links.append(full_url)
+                    except Exception as link_error:
+                        print(f"Error processing URL {href}: {str(link_error)}")
+                        continue
+                
+                # Remove duplicates
+                unique_links = list(set(unique_links))
+                print(f"Found {len(unique_links)} valid URLs on {url_to_crawl}")
+                
+                # Insert links with a MERGE statement to handle duplicates
+                for link in unique_links:
+                    try:
+                        # Use MERGE to handle unique constraint and update existing records
+                        cursor.execute("""
+                            MERGE INTO {0} t
+                            USING (
+                                SELECT 
+                                    :link AS LINK, 
+                                    :top_level_source AS TOP_LEVEL_SOURCE, 
+                                    :user_id AS USER_ID,
+                                    :source_url AS SOURCE_URL,
+                                    :depth AS DEPTH,
+                                    :has_text_in_url AS HAS_TEXT_IN_URL,
+                                    CURRENT_TIMESTAMP AS ADDED_AT
+                                FROM DUAL
+                            ) s
+                            ON (t.LINK = s.LINK AND t.USER_ID = s.USER_ID)
+                            WHEN NOT MATCHED THEN
+                                INSERT (
+                                    LINK, TOP_LEVEL_SOURCE, USER_ID, SOURCE_URL, 
+                                    DEPTH, HAS_TEXT_IN_URL, ADDED_AT, 
+                                    IS_CRAWLED, IS_PROCESSED
+                                ) VALUES (
+                                    s.LINK, s.TOP_LEVEL_SOURCE, s.USER_ID, s.SOURCE_URL,
+                                    s.DEPTH, s.HAS_TEXT_IN_URL, s.ADDED_AT,
+                                    0, 'false'
+                                )
+                            WHEN MATCHED THEN
+                                UPDATE SET 
+                                    TOP_LEVEL_SOURCE = s.TOP_LEVEL_SOURCE,
+                                    SOURCE_URL = s.SOURCE_URL,
+                                    DEPTH = LEAST(t.DEPTH, s.DEPTH)
+                        """.format(LINKS_TO_SCRAP_TABLE),
+                            link=link,
+                            top_level_source=top_level_source_url,
+                            user_id=user_id,
+                            source_url=url_to_crawl,
+                            depth=current_depth + 1,
+                            has_text_in_url=contains_text_in_url(link)
+                        )
+                        
+                        # If a new row was inserted, increment links_added
+                        if cursor.rowcount > 0:
+                            current_links_added += 1
+                        
+                    except oracledb.DatabaseError as db_error:
+                        error, = db_error.args
+                        print(f"Database error adding link {link}: {error}")
+                        # Log the error but continue processing
+                        if error.code != 1:  # Exclude unique constraint violations
+                            print(f"Non-unique constraint error: {error}")
+                
+                # Update the current link as crawled
                 cursor.execute("""
                     UPDATE {0} SET
                         IS_CRAWLED = 1,
@@ -883,45 +993,91 @@ def continuous_crawl_job(top_level_source_url, stop_event, user_id, page_limit=1
                 
                 connection.commit()
                 
-            except Exception as e:
-                error_msg = f"Error: {str(e)}"
-                tb = traceback.format_exc()
-                print(f"Error processing URL {url_to_crawl}: {error_msg}")
-                print(tb)
+                # Track links added
+                links_added += current_links_added
                 
-                # Update the link as failed
-                cursor.execute("""
-                    UPDATE {0} SET
-                        IS_CRAWLED = 1,
-                        CRAWLED_AT = CURRENT_TIMESTAMP,
-                        ERROR = :error,
-                        TRACEBACK = :traceback
-                    WHERE ID = :id
-                """.format(LINKS_TO_SCRAP_TABLE), 
-                    id=link_id, 
-                    error=error_msg[:4000],  # Limit to Oracle CLOB size
-                    traceback=tb[:4000]      # Limit to Oracle CLOB size
-                )
+                # Update consecutive empty runs counter
+                if current_links_added > 0:
+                    consecutive_empty_runs = 0
+                else:
+                    consecutive_empty_runs += 1
                 
-                connection.commit()
+                # Check if we've had too many consecutive runs with no new links
+                if consecutive_empty_runs >= max_consecutive_empty_runs:
+                    print(f"No new links found for {max_consecutive_empty_runs} consecutive runs. Exiting crawl job.")
+                    break
+                
+                # After processing, check if we've now reached the limit
+                if page_limit > 0 and already_crawled_count + 1 >= page_limit:
+                    print(f"REACHED PAGE LIMIT: {already_crawled_count + 1}/{page_limit} pages crawled. Exiting crawl job.")
+                    break
+                
+            except requests.exceptions.RequestException as req_error:
+                # Handle request-specific errors (network, timeout, etc.)
+                print(f"Request error processing URL {url_to_crawl}: {str(req_error)}")
+                
+                # Update link as crawled with error
+                try:
+                    cursor.execute("""
+                        UPDATE {0} SET
+                            IS_CRAWLED = 1,
+                            CRAWLED_AT = CURRENT_TIMESTAMP,
+                            ERROR = :error
+                        WHERE ID = :id
+                    """.format(LINKS_TO_SCRAP_TABLE), 
+                        id=link_id,
+                        error=str(req_error)[:4000]  # Limit error message length
+                    )
+                    connection.commit()
+                except Exception as update_error:
+                    print(f"Error updating link status: {str(update_error)}")
+                
                 errors_encountered += 1
                 consecutive_empty_runs += 1
             
-            # Close the connection after each link to prevent connection leaks
-            if cursor:
-                cursor.close()
-                cursor = None
-            if connection:
-                connection.close()
-                connection = None
+            except Exception as e:
+                # Catch any other unexpected errors
+                print(f"Unexpected error processing URL {url_to_crawl}: {str(e)}")
+                traceback.print_exc()
+                
+                # Update link as crawled with error
+                try:
+                    cursor.execute("""
+                        UPDATE {0} SET
+                            IS_CRAWLED = 1,
+                            CRAWLED_AT = CURRENT_TIMESTAMP,
+                            ERROR = :error,
+                            TRACEBACK = :traceback
+                        WHERE ID = :id
+                    """.format(LINKS_TO_SCRAP_TABLE), 
+                        id=link_id,
+                        error=str(e)[:4000],
+                        traceback=traceback.format_exc()[:4000]
+                    )
+                    connection.commit()
+                except Exception as update_error:
+                    print(f"Error updating link status: {str(update_error)}")
+                
+                errors_encountered += 1
+                consecutive_empty_runs += 1
             
-            # Optional: Sleep to prevent hammering the target server
-            time.sleep(0.5)
+            finally:
+                # Close database connection after each iteration
+                if cursor:
+                    cursor.close()
+                    cursor = None
+                if connection:
+                    connection.close()
+                    connection = None
+                
+                # Optional: Sleep to prevent hammering the target server
+                time.sleep(0.5)
         
-        # Get final count of crawled pages
+        # Final database connection to get final stats
         connection = get_oracle_connection()
         cursor = connection.cursor()
         
+        # Get final count of crawled pages
         cursor.execute("""
             SELECT COUNT(*) FROM {0}
             WHERE IS_CRAWLED = 1 AND TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
