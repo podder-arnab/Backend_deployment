@@ -1,7 +1,7 @@
 from flask import Blueprint, request, jsonify
 from functools import wraps
 import jwt
-import datetime
+from datetime import datetime
 import traceback
 import oracledb  # Make sure this is installed
 from dotenv import load_dotenv
@@ -14,6 +14,7 @@ import time
 import json
 import validators
 from threading import Lock, Thread, Event
+from contextlib import contextmanager
 
 # Load environment variables from .env file
 load_dotenv()
@@ -55,6 +56,91 @@ def get_oracle_connection():
         print(f"Error connecting to Oracle DB: {e}")
         traceback.print_exc()
         raise
+# At the top of file_api.py
+# Configure connection pool settings
+
+MAX_RETRIES = 3
+RETRY_DELAY = 1
+connection_pool = None
+
+def initialize_connection_pool():
+    """Initialize Oracle connection pool"""
+    global connection_pool
+    try:
+        connection_pool = oracledb.create_pool(
+            user=ORACLE_USER,
+            password=ORACLE_PASSWORD,
+            dsn=ORACLE_DSN,
+            min=2,
+            max=10,
+            increment=1,
+            wait_timeout=1000,
+            max_lifetime_session=28800,
+            config_dir="Wallet_jsondb",
+            wallet_location="Wallet_jsondb",
+            wallet_password=ORACLE_PASSWORD
+        )
+        print(f"Connection pool created successfully with {connection_pool.min} to {connection_pool.max} connections")
+        return True
+    except Exception as e:
+        print(f"Error creating connection pool: {e}")
+        traceback.print_exc()
+        return False
+
+@contextmanager
+def get_db_connection():
+    """Context manager for database connections with retry logic"""
+    conn = None
+    retries = 0
+    
+    while retries < MAX_RETRIES:
+        try:
+            global connection_pool
+            if connection_pool is None:
+                initialize_connection_pool()
+                
+            if connection_pool:
+                conn = connection_pool.acquire()
+            else:
+                # Fallback to direct connection if pool fails
+                conn = oracledb.connect(
+                    user=ORACLE_USER,
+                    password=ORACLE_PASSWORD,
+                    dsn=ORACLE_DSN,
+                    config_dir="Wallet_jsondb",
+                    wallet_location="Wallet_jsondb",
+                    wallet_password=ORACLE_PASSWORD
+                )
+                
+            yield conn
+            return
+        except oracledb.DatabaseError as e:
+            retries += 1
+            print(f"Database connection attempt {retries} failed: {e}")
+            
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+                    
+            # Wait before retrying with exponential backoff
+            wait_time = RETRY_DELAY * (2 ** (retries - 1))
+            time.sleep(wait_time)
+        except Exception as e:
+            print(f"Unexpected error getting connection: {e}")
+            traceback.print_exc()
+            
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+            
+            raise
+            
+    # If we reach here, all retries failed
+    raise Exception(f"Failed to establish database connection after {MAX_RETRIES} attempts")
 
 def initialize_tables():
     """Initialize all necessary tables if they don't exist"""
@@ -217,7 +303,7 @@ def token_required(fn):
             return jsonify({
                 'status': 'error',
                 'message': 'Unauthorized access. Valid token required.',
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.now().isoformat()  # Fixed datetime usage
             }), 401
         return fn(user_id, *args, **kwargs)
     wrapper.__name__ = fn.__name__
@@ -230,7 +316,21 @@ def is_valid_url(url):
     except:
         # Some URLs might cause validators to raise exceptions
         return False
-
+    
+def get_oracle_connection_with_retry(max_retries=3, retry_delay=1):
+    """Get database connection with retry logic"""
+    for attempt in range(max_retries):
+        try:
+            return get_oracle_connection()
+        except oracledb.DatabaseError as e:
+            if attempt < max_retries - 1:
+                print(f"Connection attempt {attempt+1} failed: {e}. Retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                print(f"All {max_retries} connection attempts failed")
+                raise
+            
 def is_valid_content_url(url):
     """Check if URL is likely to contain text content"""
     # Skip common non-text content URLs and query params that indicate non-content
@@ -2294,7 +2394,7 @@ def get_progress_bar():
             return jsonify({
                 'status': 'error',
                 'message': 'source_url is required.',
-                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
+                'timestamp': datetime.now().isoformat()  # Fixed datetime usage
             }), 400
 
         connection = get_oracle_connection()
@@ -2334,7 +2434,7 @@ def get_progress_bar():
 
         # Skip calculation if no links found
         if total_links == 0:
-            current_time = datetime.datetime.now()  # Fixed datetime usage
+            current_time = datetime.now()  # Fixed datetime usage
             return jsonify({
                 'status': 'pending',
                 'message': f'No links found for {source_url}',
@@ -2437,7 +2537,7 @@ def get_progress_bar():
             status = 'pending'
 
         # Calculate change in percentages since last check
-        current_timestamp = datetime.datetime.now()  # Fixed datetime usage
+        current_timestamp = datetime.now()  # Fixed datetime usage
         change_since_last = {
             'crawl_progress_change': 0,
             'scrape_progress_change': 0,
@@ -2450,7 +2550,7 @@ def get_progress_bar():
         }
 
         if last_progress:
-            last_timestamp = datetime.datetime.strptime(last_progress['timestamp'], '%Y-%m-%dT%H:%M:%SZ')
+            last_timestamp = datetime.strptime(last_progress['timestamp'], '%Y-%m-%dT%H:%M:%SZ')
             time_diff_seconds = (current_timestamp - last_timestamp).total_seconds()
             time_diff_minutes = time_diff_seconds / 60
 
@@ -2488,7 +2588,7 @@ def get_progress_bar():
                 change_since_last['estimated_completion_minutes'] = round(total_estimated_minutes, 1)
 
                 # Calculate the absolute timestamp for estimated completion
-                estimated_completion_time = current_timestamp + datetime.timedelta(minutes=total_estimated_minutes)
+                estimated_completion_time = current_timestamp + timedelta(minutes=total_estimated_minutes)
                 change_since_last['estimated_completion_time'] = estimated_completion_time.isoformat()
 
                 # Add human-readable estimate
@@ -2547,7 +2647,7 @@ def get_progress_bar():
             'status': 'error',
             'message': str(e),
             'error_details': traceback.format_exc(),
-            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
+            'timestamp': datetime.now().isoformat()  # Fixed datetime usage
         }), 500
     finally:
         if cursor:
@@ -2555,7 +2655,7 @@ def get_progress_bar():
         if connection:
             connection.close()
 
-@file_api.route('/discovered-links', methods=['GET'])
+@file_api.route('/get-discovered-links', methods=['GET'])
 @token_required
 def get_discovered_links(user_id):
     connection = None
@@ -2700,7 +2800,7 @@ def scrapped_sub_links():
             return jsonify({
                 'status': 'error',
                 'message': 'Request body is required.',
-                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
+                'timestamp': datetime.now().isoformat()  # Fixed datetime usage
             }), 400
         
         source_url = data.get('source_url')
@@ -2711,7 +2811,7 @@ def scrapped_sub_links():
             return jsonify({
                 'status': 'error',
                 'message': 'source_url is required in the request body.',
-                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
+                'timestamp': datetime.now().isoformat()  # Fixed datetime usage
             }), 400
         
         connection = get_oracle_connection()
@@ -2773,7 +2873,7 @@ def scrapped_sub_links():
                 'has_prev': has_prev
             },
             'source_url': source_url,
-            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
+            'timestamp': datetime.now().isoformat()  # Fixed datetime usage
         })
         
     except Exception as e:
@@ -2785,13 +2885,14 @@ def scrapped_sub_links():
             'status': 'error',
             'message': str(e),
             'traceback': traceback.format_exc(),
-            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
+            'timestamp': datetime.now().isoformat()  # Fixed datetime usage
         }), 500
     finally:
         if cursor:
             cursor.close()
         if connection:
             connection.close()
+
 @file_api.route('/get-pending-links', methods=['GET'])
 @token_required
 def get_pending_links(user_id, source_url=None):
@@ -2824,7 +2925,7 @@ def get_pending_links(user_id, source_url=None):
             'status': 'success',
             'pending_links': pending_count,
             'source_url': source_url,
-            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
+            'timestamp': datetime.now().isoformat()  # Fixed datetime usage
         })
     except Exception as e:
         print(f"Error getting pending links: {str(e)}")
@@ -2869,7 +2970,7 @@ def get_scrapped_links(user_id, source_url=None):
             'status': 'success',
             'scrapped_links': scraped_count,
             'source_url': source_url,
-            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
+            'timestamp': datetime.now().isoformat()  # Fixed datetime usage
         })
     except Exception as e:
         print(f"Error getting scraped links: {str(e)}")
@@ -2918,7 +3019,7 @@ def get_total_words_scrapped(user_id, source_url=None):
             'status': 'success',
             'total_words': total_words,
             'source_url': source_url,
-            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
+            'timestamp': datetime.now().isoformat()  # Fixed datetime usage
         })
     except Exception as e:
         print(f"Error getting total words: {str(e)}")
@@ -3038,68 +3139,68 @@ def stop_processing_job(user_id):  # Renamed to avoid conflicts
             'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
         }), 500
     
-@file_api.route('/get-discovered-links', methods=['GET'])
-@token_required
-def fetch_discovered_links_v2(user_id, source_url=None):
-    connection = None
-    cursor = None
-    try:
-        # If source_url parameter was not passed to the function, try to get it from request.args
-        if source_url is None:
-            source_url = request.args.get('source_url')
+# @file_api.route('/get-discovered-links', methods=['GET'])
+# @token_required
+# def fetch_discovered_links_v2(user_id, source_url=None):
+#     connection = None
+#     cursor = None
+#     try:
+#         # If source_url parameter was not passed to the function, try to get it from request.args
+#         if source_url is None:
+#             source_url = request.args.get('source_url')
         
-        connection = get_oracle_connection()
-        cursor = connection.cursor()
+#         connection = get_oracle_connection()
+#         cursor = connection.cursor()
         
-        # Build query with user_id
-        query = """
-            SELECT LINK FROM {0}
-            WHERE USER_ID = :user_id
-        """.format(LINKS_TO_SCRAP_TABLE)
+#         # Build query with user_id
+#         query = """
+#             SELECT LINK FROM {0}
+#             WHERE USER_ID = :user_id
+#         """.format(LINKS_TO_SCRAP_TABLE)
         
-        params = {'user_id': user_id}
+#         params = {'user_id': user_id}
         
-        if source_url:
-            query += " AND TOP_LEVEL_SOURCE = :source_url"
-            params['source_url'] = source_url
+#         if source_url:
+#             query += " AND TOP_LEVEL_SOURCE = :source_url"
+#             params['source_url'] = source_url
         
-        # Execute query to get distinct links
-        cursor.execute(f"""
-            SELECT DISTINCT LINK FROM ({query})
-        """, params)
+#         # Execute query to get distinct links
+#         cursor.execute(f"""
+#             SELECT DISTINCT LINK FROM ({query})
+#         """, params)
         
-        discovered_links = [row[0] for row in cursor.fetchall()]
+#         discovered_links = [row[0] for row in cursor.fetchall()]
         
-        # Count by domain
-        domains = {}
-        for link in discovered_links:
-            try:
-                domain = link.split('//', 1)[1].split('/', 1)[0] if '//' in link else link.split('/', 1)[0]
-                domains[domain] = domains.get(domain, 0) + 1
-            except:
-                continue
+#         # Count by domain
+#         domains = {}
+#         for link in discovered_links:
+#             try:
+#                 domain = link.split('//', 1)[1].split('/', 1)[0] if '//' in link else link.split('/', 1)[0]
+#                 domains[domain] = domains.get(domain, 0) + 1
+#             except:
+#                 continue
         
-        # Convert to list of dictionaries for response
-        domain_stats = [{'domain': domain, 'count': count} for domain, count in domains.items()]
+#         # Convert to list of dictionaries for response
+#         domain_stats = [{'domain': domain, 'count': count} for domain, count in domains.items()]
         
-        return jsonify({
-            'status': 'success',
-            'total_links': len(discovered_links),
-            'domain_stats': domain_stats,
-            'source_url': source_url,
-            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
-        })
-    except Exception as e:
-        print(f"Error getting discovered links: {str(e)}")
-        traceback.print_exc()
-        if connection:
-            connection.rollback()
-        return standardize_error_response(str(e), 'DB_ERROR', 500)
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close() 
+#         return jsonify({
+#             'status': 'success',
+#             'total_links': len(discovered_links),
+#             'domain_stats': domain_stats,
+#             'source_url': source_url,
+#             'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
+#         })
+#     except Exception as e:
+#         print(f"Error getting discovered links: {str(e)}")
+#         traceback.print_exc()
+#         if connection:
+#             connection.rollback()
+#         return standardize_error_response(str(e), 'DB_ERROR', 500)
+#     finally:
+#         if cursor:
+#             cursor.close()
+#         if connection:
+#             connection.close() 
 
 @file_api.route('/all-documents', methods=['GET'])
 @token_required
@@ -3109,111 +3210,114 @@ def get_all_documents(user_id):
     try:
         print(f"Fetching all documents for user: {user_id}")
         
+        # Get pagination parameters (optional)
+        limit = request.args.get('limit', 100, type=int)
+        offset = request.args.get('offset', 0, type=int)
+        
         connection = get_oracle_connection()
         cursor = connection.cursor()
         
-        # Fetch all source URLs for this user, sorted by timestamp in descending order (latest first)
+        # Get all source URLs for this user with their timestamps
         print(f"Querying {SOURCE_URLS_TABLE} for user: {user_id}")
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT SOURCE_URL, 
                    TO_CHAR(TIMESTAMP, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as TIMESTAMP,
                    PAGE_LIMIT
-            FROM {0}
+            FROM {SOURCE_URLS_TABLE}
             WHERE USER_ID = :user_id
             ORDER BY TIMESTAMP DESC
-        """.format(SOURCE_URLS_TABLE), user_id=user_id)
+            OFFSET :offset ROWS FETCH NEXT :limit ROWS ONLY
+        """, user_id=user_id, offset=offset, limit=limit)
         
         source_urls = cursor.fetchall()
+        source_url_list = [row[0] for row in source_urls]
         print(f"Found {len(source_urls)} source URLs for user: {user_id}")
         
+        if not source_urls:
+            return jsonify({
+                'status': 'success',
+                'documents': [],
+                'count': 0,
+                'timestamp': datetime.now().isoformat()  # Fixed datetime usage
+            })
+        
+        # Query to get all stats in a single operation using CASE statements
+        url_params = {f'url_{i}': url for i, url in enumerate(source_url_list)}
+        
+        # Prepare the parameter placeholders for the IN clause
+        url_placeholders = [f':url_{i}' for i in range(len(source_url_list))]
+        url_in_clause = ', '.join(url_placeholders)
+        
+        # Get all link stats in one query
+        link_stats_query = f"""
+            SELECT 
+                TOP_LEVEL_SOURCE,
+                COUNT(*) as total_links,
+                SUM(CASE WHEN IS_PROCESSED = 'true' THEN 1 ELSE 0 END) as processed_links,
+                SUM(CASE WHEN IS_PROCESSED = 'Failed' THEN 1 ELSE 0 END) as failed_links
+            FROM {LINKS_TO_SCRAP_TABLE}
+            WHERE USER_ID = :user_id
+            AND TOP_LEVEL_SOURCE IN ({url_in_clause})
+            GROUP BY TOP_LEVEL_SOURCE
+        """
+        
+        cursor.execute(link_stats_query, user_id=user_id, **url_params)
+        link_stats = {row[0]: {'total': row[1], 'processed': row[2], 'failed': row[3]} for row in cursor.fetchall()}
+        
+        # Get all scrapped text stats in one query
+        scrapped_query = f"""
+            SELECT 
+                TOP_LEVEL_SOURCE,
+                COUNT(*) as scrapped_count
+            FROM {SCRAPPED_TEXT_TABLE}
+            WHERE USER_ID = :user_id
+            AND TOP_LEVEL_SOURCE IN ({url_in_clause})
+            GROUP BY TOP_LEVEL_SOURCE
+        """
+        
+        cursor.execute(scrapped_query, user_id=user_id, **url_params)
+        scrapped_stats = {row[0]: row[1] for row in cursor.fetchall()}
+        
+        # Get queue information
+        queue_query = f"""
+            SELECT 
+                SOURCE_URL,
+                PROCESSED,
+                PROCESSING_STARTED
+            FROM {PROCESSING_QUEUE_TABLE}
+            WHERE USER_ID = :user_id
+            AND SOURCE_URL IN ({url_in_clause})
+        """
+        
+        cursor.execute(queue_query, user_id=user_id, **url_params)
+        queue_info = {row[0]: {'processed': row[1], 'processing_started': row[2]} for row in cursor.fetchall()}
+        
+        # Construct documents array
         documents = []
-        for source_url_row in source_urls:
-            source_url, timestamp, page_limit = source_url_row
-            print(f"Processing source URL: {source_url}")
-            
-            # Count the number of processed links for this source URL
-            cursor.execute("""
-                SELECT COUNT(*) FROM {0}
-                WHERE TOP_LEVEL_SOURCE = :source_url
-                AND IS_PROCESSED = 'true'
-                AND USER_ID = :user_id
-            """.format(LINKS_TO_SCRAP_TABLE), source_url=source_url, user_id=user_id)
-            
-            processed_count = cursor.fetchone()[0]
-            
-            # Count the total number of links for this source URL
-            cursor.execute("""
-                SELECT COUNT(*) FROM {0}
-                WHERE TOP_LEVEL_SOURCE = :source_url
-                AND USER_ID = :user_id
-            """.format(LINKS_TO_SCRAP_TABLE), source_url=source_url, user_id=user_id)
-            
-            total_links = cursor.fetchone()[0]
-            
-            # Count the number of scrapped texts for this source URL
-            cursor.execute("""
-                SELECT COUNT(*) FROM {0}
-                WHERE TOP_LEVEL_SOURCE = :source_url
-                AND USER_ID = :user_id
-            """.format(SCRAPPED_TEXT_TABLE), source_url=source_url, user_id=user_id)
-            
-            scrapped_count = cursor.fetchone()[0]
-            
-            # Count the number of failed links for this source URL
-            cursor.execute("""
-                SELECT COUNT(*) FROM {0}
-                WHERE TOP_LEVEL_SOURCE = :source_url
-                AND IS_PROCESSED = 'Failed'
-                AND USER_ID = :user_id
-            """.format(LINKS_TO_SCRAP_TABLE), source_url=source_url, user_id=user_id)
-            
-            failed_count = cursor.fetchone()[0]
-            
-            print(f"Source URL: {source_url}, Processed: {processed_count}, Total: {total_links}, Scrapped: {scrapped_count}, Failed: {failed_count}")
+        for source_url, timestamp, page_limit in source_urls:
+            stats = link_stats.get(source_url, {'total': 0, 'processed': 0, 'failed': 0})
+            total_links = stats['total']
+            processed_count = stats['processed']
+            failed_count = stats['failed']
+            scrapped_count = scrapped_stats.get(source_url, 0)
             
             # Calculate progress percentages
             crawl_progress = 0
             scrape_progress = 0
             
             if total_links > 0:
-                # Calculate crawling and scraping progress
                 crawl_progress = round((processed_count + failed_count) / total_links * 100, 1)
-                scrape_progress = round(scrapped_count / total_links * 100, 1)
+                scrape_progress = round(scrapped_count / total_links * 100, 1) if total_links > 0 else 0
             
-            # Check if this URL is in the queue
-            cursor.execute("""
-                SELECT COUNT(*), MIN(PROCESSED), MIN(PROCESSING_STARTED)
-                FROM {0}
-                WHERE USER_ID = :user_id AND SOURCE_URL = :source_url
-            """.format(PROCESSING_QUEUE_TABLE), user_id=user_id, source_url=source_url)
-            
-            queue_count, is_processed, is_processing = cursor.fetchone()
-            in_queue = queue_count > 0
+            # Check if URL is in queue
+            in_queue = source_url in queue_info
             queue_position = None
+            queue_item = queue_info.get(source_url, {})
+            is_processed = queue_item.get('processed', 0) == 1
+            is_processing = queue_item.get('processing_started') is not None
             
-            # Determine if this source URL is active
-            is_active = False
-            if user_id in active_user_jobs and source_url in active_user_jobs[user_id]:
-                is_active = True
-            
-            # Get queue position if in queue
-            if in_queue and is_processed == 0 and is_processing is None:
-                cursor.execute("""
-                    SELECT COUNT(*) FROM {0} q1
-                    WHERE q1.USER_ID = :user_id
-                    AND q1.PROCESSED = 0
-                    AND q1.PROCESSING_STARTED IS NULL
-                    AND q1.ADDED_AT < (
-                        SELECT q2.ADDED_AT FROM {0} q2
-                        WHERE q2.USER_ID = :user_id 
-                        AND q2.SOURCE_URL = :source_url
-                        AND q2.PROCESSED = 0
-                        AND q2.PROCESSING_STARTED IS NULL
-                    )
-                """.format(PROCESSING_QUEUE_TABLE), user_id=user_id, source_url=source_url)
-                
-                ahead_count = cursor.fetchone()[0]
-                queue_position = ahead_count + 1  # 1-based indexing
+            # Determine if URL is active job
+            is_active = user_id in active_user_jobs and source_url in active_user_jobs.get(user_id, set())
             
             # Determine document status
             if total_links == 0:
@@ -3222,8 +3326,9 @@ def get_all_documents(user_id):
                 status = 'Completed'
             elif is_active:
                 status = 'In Progress'
-            elif in_queue and is_processed == 0 and is_processing is None:
+            elif in_queue and not is_processed and not is_processing:
                 status = 'Queued'
+                # Calculate queue position if needed here
             else:
                 status = 'Pending'
             
@@ -3246,11 +3351,22 @@ def get_all_documents(user_id):
             
             documents.append(document)
         
+        # Get the total count for pagination information
+        cursor.execute(f"""
+            SELECT COUNT(*) FROM {SOURCE_URLS_TABLE}
+            WHERE USER_ID = :user_id
+        """, user_id=user_id)
+        
+        total_count = cursor.fetchone()[0]
+        
         return jsonify({
             'status': 'success',
             'documents': documents,
             'count': len(documents),
-            'timestamp': datetime.datetime.now().isoformat()
+            'total': total_count,
+            'limit': limit,
+            'offset': offset,
+            'timestamp': datetime.now().isoformat()  # Fixed datetime usage
         })
     
     except Exception as e:
@@ -3287,7 +3403,7 @@ def standardize_error_response(error, code=None, status_code=500):
     response = {
         'status': 'error',
         'message': error_message,
-        'timestamp': datetime.now().isoformat()
+        'timestamp': datetime.now().isoformat()  # Fixed datetime usage
     }
     
     if code:
@@ -3295,10 +3411,11 @@ def standardize_error_response(error, code=None, status_code=500):
         
     if traceback_str and status_code >= 500:
         # Include traceback in response for server errors
-        logger.error(f"Server error: {error_message}\n{traceback_str}")
+        print(f"Server error: {error_message}\n{traceback_str}")
         response['error_details'] = traceback_str
         
     return jsonify(response), status_code
+
     
 # Example usage in an endpoint:
 # try:

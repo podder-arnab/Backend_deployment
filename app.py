@@ -197,7 +197,7 @@ def all_documents_redirect():
     # Pass user_id explicitly
     return get_all_documents(user_id)
 
-@app.route('/discovered-links', methods=['GET', 'OPTIONS'])
+@app.route('/get-discovered-links', methods=['GET', 'OPTIONS'])
 def discovered_links_redirect():
     if request.method == 'OPTIONS':
         return options_route('')

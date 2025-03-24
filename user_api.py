@@ -1,7 +1,8 @@
+# Update the imports at the top of the file
 from flask import request, jsonify, Blueprint
 from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
-import datetime
+from datetime import datetime, timedelta  # Fix: import both datetime and timedelta
 import re
 import os
 import oracledb
@@ -270,7 +271,7 @@ def generate_auth_token(user):
             'name': user['name'],
             'username': user['username'],
             'email': user['email'],
-            'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=TOKEN_EXPIRY_HOURS)
+            'exp': datetime.utcnow() + timedelta(hours=TOKEN_EXPIRY_HOURS)  # Fix: use datetime and timedelta directly
         }
         return jwt.encode(payload, SECRET_KEY, algorithm='HS256')
     except Exception as e:
