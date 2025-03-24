@@ -57,9 +57,8 @@ def standardize_error_response(error, code=None, status_code=500):
         # Include traceback in response for server errors
         logger.error(f"Server error: {error_message}\n{traceback_str}")
         response['error_details'] = traceback_str
-    
-    resp = jsonify(response), status_code
-    return resp
+        
+    return jsonify(response), status_code
 
 # Helper function to verify JWT tokens
 def verify_token():
@@ -90,7 +89,6 @@ def add_cors_to_response(response):
         response.headers['Access-Control-Allow-Origin'] = '*'
         response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With'
-        response.headers['Access-Control-Allow-Credentials'] = 'true'
     return response
 
 # CORS handling for all responses
@@ -106,7 +104,6 @@ def options_route(path):
     response.headers['Access-Control-Allow-Origin'] = '*'
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With'
-    response.headers['Access-Control-Allow-Credentials'] = 'true'
     return response
 
 # Root routes
