@@ -261,8 +261,8 @@ def source_url_status_redirect():
     # Import and call the function from file_api
     from file_api import get_source_url_status
     
-    # Pass user_id explicitly
-    return get_source_url_status(user_id)
+    # Don't pass user_id explicitly - let the decorator handle it
+    return get_source_url_status()
 
 @app.route('/queue-status', methods=['GET', 'OPTIONS'])
 def queue_status_redirect():
@@ -291,8 +291,8 @@ def recursive_crawl_redirect():
     # Import and call the function from file_api
     from file_api import recursive_crawl
     
-    # Pass user_id explicitly
-    return recursive_crawl(user_id)
+    # DON'T pass user_id explicitly - let the decorator handle it
+    return recursive_crawl()
 
 @app.route('/process-all-links', methods=['POST', 'OPTIONS'])
 def process_all_links_redirect():
@@ -306,8 +306,8 @@ def process_all_links_redirect():
     # Import and call the function from file_api
     from file_api import process_all_links
     
-    # Pass user_id explicitly
-    return process_all_links(user_id)
+    # DON'T pass user_id explicitly - let the decorator handle it
+    return process_all_links()
 
 @app.route('/stop-crawling', methods=['POST', 'OPTIONS'])
 def stop_crawling_redirect():

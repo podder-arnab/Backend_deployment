@@ -1578,7 +1578,7 @@ def recursive_crawl(user_id):
                 'stats': {
                     'total_links': links_count
                 },
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
             })
         
         # Check if the URL exists in Links_to_scrap
@@ -1680,7 +1680,7 @@ def recursive_crawl(user_id):
                 return jsonify({
                     'status': 'queued',
                     'message': f'URL {top_level_source_url} has been added to the processing queue with a limit of {page_limit} pages.',
-                    'timestamp': datetime.now().isoformat(),
+                    'timestamp': datetime.datetime.now().isoformat(),
                     'source_url': top_level_source_url,
                     'page_limit': page_limit
                 })
@@ -1696,7 +1696,7 @@ def recursive_crawl(user_id):
                 return jsonify({
                     'status': 'success',
                     'message': f'Continuous crawling started for {top_level_source_url} with a limit of {page_limit} pages',
-                    'timestamp': datetime.now().isoformat(),
+                    'timestamp': datetime.datetime.now().isoformat(),
                     'source_url': top_level_source_url,
                     'page_limit': page_limit
                 })
@@ -1714,6 +1714,7 @@ def recursive_crawl(user_id):
             cursor.close()
         if connection:
             connection.close()
+
             
 @file_api.route('/process-all-links', methods=['POST'])
 @token_required
@@ -1741,7 +1742,7 @@ def process_all_links(user_id):
             return jsonify({
                 'status': 'error',
                 'message': 'source_url is required in the POST body.',
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
             }), 400
 
         connection = get_oracle_connection()
@@ -1764,7 +1765,7 @@ def process_all_links(user_id):
             return jsonify({
                 'status': 'complete',
                 'message': f'No unprocessed links found for {source_url}',
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
             })
         
         # Check if user has an active job
@@ -1778,14 +1779,14 @@ def process_all_links(user_id):
                 return jsonify({
                     'status': 'queued',
                     'message': f'URL {source_url} has been added to the processing queue.',
-                    'timestamp': datetime.now().isoformat(),
+                    'timestamp': datetime.datetime.now().isoformat(),  # Fixed datetime usage
                     'source_url': source_url
                 })
             else:
                 return jsonify({
                     'status': 'error',
                     'message': f'Failed to add URL {source_url} to the queue.',
-                    'timestamp': datetime.now().isoformat()
+                    'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
                 }), 500
         else:
             print(f"No active job for user {user_id}. Starting processing for: {source_url} with delay: {delay_seconds}s")
@@ -1797,14 +1798,14 @@ def process_all_links(user_id):
                 return jsonify({
                     'status': 'success',
                     'message': f'Continuous processing started for {source_url} with a delay of {delay_seconds} seconds',
-                    'timestamp': datetime.now().isoformat(),
+                    'timestamp': datetime.datetime.now().isoformat(),  # Fixed datetime usage
                     'source_url': source_url
                 })
             else:
                 return jsonify({
                     'status': 'error',
                     'message': f'Failed to start processing for {source_url}',
-                    'timestamp': datetime.now().isoformat()
+                    'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
                 }), 500
     
     except Exception as e:
@@ -1816,7 +1817,7 @@ def process_all_links(user_id):
             'status': 'error',
             'message': str(e),
             'traceback': traceback_str,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
         }), 500
     finally:
         if cursor:
@@ -1883,7 +1884,7 @@ def get_queue_status(user_id):
             'has_active_job': has_active_job,
             'active_job_url': active_job_url,
             'queue_length': len(queue_items),
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
         })
     except Exception as e:
         print(f"Error getting queue status: {str(e)}")
@@ -1894,7 +1895,7 @@ def get_queue_status(user_id):
             'status': 'error',
             'message': str(e),
             'traceback': traceback.format_exc(),
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
         }), 500
     finally:
         if cursor:
@@ -1911,13 +1912,15 @@ def get_source_url_status(user_id):
     try:
         print(f"Getting source URL status for user: {user_id}")
         
+        # Get source_url from request args
         source_url = request.args.get('source_url')
+            
         if not source_url:
             print("source_url parameter is missing")
             return jsonify({
                 'status': 'error',
                 'message': 'source_url is required.',
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.datetime.now().isoformat()
             }), 400
         
         print(f"Checking status for source URL: {source_url}")
@@ -2041,7 +2044,7 @@ def get_source_url_status(user_id):
                 'queue_position': queue_position,
                 'page_limit': page_limit
             },
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.datetime.now().isoformat()
         })
     except Exception as e:
         print(f"Error getting source URL status: {str(e)}")
@@ -2052,7 +2055,7 @@ def get_source_url_status(user_id):
             'status': 'error',
             'message': str(e),
             'traceback': traceback.format_exc(),
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.datetime.now().isoformat()
         }), 500
     finally:
         if cursor:
@@ -2073,7 +2076,7 @@ def stop_crawling(user_id):
             return jsonify({
                 'status': 'error',
                 'message': 'source_url is required in the POST body.',
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
             }), 400
             
         source_url = data['source_url']
@@ -2099,14 +2102,14 @@ def stop_crawling(user_id):
                 'status': 'success',
                 'message': f'Crawling for {source_url} has been stopped.',
                 'next_started': start_next,
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
             })
         else:
             print(f"No active crawling found for {crawl_key}")
             return jsonify({
                 'status': 'error',
                 'message': f'No active crawling found for {source_url}',
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
             }), 404
             
     except Exception as e:
@@ -2116,7 +2119,7 @@ def stop_crawling(user_id):
             'status': 'error',
             'message': str(e),
             'traceback': traceback.format_exc(),
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
         }), 500
 
 @file_api.route('/progress-bar', methods=['GET'])
@@ -2135,7 +2138,7 @@ def get_progress_bar():
             return jsonify({
                 'status': 'error',
                 'message': 'source_url is required.',
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
             }), 400
 
         connection = get_oracle_connection()
@@ -2175,7 +2178,7 @@ def get_progress_bar():
 
         # Skip calculation if no links found
         if total_links == 0:
-            current_time = datetime.now()
+            current_time = datetime.datetime.now()  # Fixed datetime usage
             return jsonify({
                 'status': 'pending',
                 'message': f'No links found for {source_url}',
@@ -2278,7 +2281,7 @@ def get_progress_bar():
             status = 'pending'
 
         # Calculate change in percentages since last check
-        current_timestamp = datetime.now()
+        current_timestamp = datetime.datetime.now()  # Fixed datetime usage
         change_since_last = {
             'crawl_progress_change': 0,
             'scrape_progress_change': 0,
@@ -2291,7 +2294,7 @@ def get_progress_bar():
         }
 
         if last_progress:
-            last_timestamp = datetime.strptime(last_progress['timestamp'], '%Y-%m-%dT%H:%M:%SZ')
+            last_timestamp = datetime.datetime.strptime(last_progress['timestamp'], '%Y-%m-%dT%H:%M:%SZ')
             time_diff_seconds = (current_timestamp - last_timestamp).total_seconds()
             time_diff_minutes = time_diff_seconds / 60
 
@@ -2329,7 +2332,7 @@ def get_progress_bar():
                 change_since_last['estimated_completion_minutes'] = round(total_estimated_minutes, 1)
 
                 # Calculate the absolute timestamp for estimated completion
-                estimated_completion_time = current_timestamp + timedelta(minutes=total_estimated_minutes)
+                estimated_completion_time = current_timestamp + datetime.timedelta(minutes=total_estimated_minutes)
                 change_since_last['estimated_completion_time'] = estimated_completion_time.isoformat()
 
                 # Add human-readable estimate
@@ -2388,7 +2391,7 @@ def get_progress_bar():
             'status': 'error',
             'message': str(e),
             'error_details': traceback.format_exc(),
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
         }), 500
     finally:
         if cursor:
@@ -2471,7 +2474,7 @@ def remove_from_queue(user_id):
             return jsonify({
                 'status': 'error',
                 'message': 'source_url is required in the request body.',
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
             }), 400
                 
         source_url = data['source_url']
@@ -2494,7 +2497,7 @@ def remove_from_queue(user_id):
             return jsonify({
                 'status': 'error',
                 'message': f'URL {source_url} is not in the queue or is already being processed.',
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
             }), 404
                 
         # Remove the URL from the queue
@@ -2508,7 +2511,7 @@ def remove_from_queue(user_id):
         return jsonify({
             'status': 'success',
             'message': f'URL {source_url} has been removed from the queue.',
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
         })
     except Exception as e:
         print(f"Error removing from queue: {str(e)}")
@@ -2519,7 +2522,7 @@ def remove_from_queue(user_id):
             'status': 'error',
             'message': str(e),
             'traceback': traceback.format_exc(),
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
         }), 500
     finally:
         if cursor:
@@ -2541,7 +2544,7 @@ def scrapped_sub_links():
             return jsonify({
                 'status': 'error',
                 'message': 'Request body is required.',
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
             }), 400
         
         source_url = data.get('source_url')
@@ -2552,7 +2555,7 @@ def scrapped_sub_links():
             return jsonify({
                 'status': 'error',
                 'message': 'source_url is required in the request body.',
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
             }), 400
         
         connection = get_oracle_connection()
@@ -2614,7 +2617,7 @@ def scrapped_sub_links():
                 'has_prev': has_prev
             },
             'source_url': source_url,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
         })
         
     except Exception as e:
@@ -2626,7 +2629,7 @@ def scrapped_sub_links():
             'status': 'error',
             'message': str(e),
             'traceback': traceback.format_exc(),
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
         }), 500
     finally:
         if cursor:
@@ -2635,11 +2638,13 @@ def scrapped_sub_links():
             connection.close()
 @file_api.route('/get-pending-links', methods=['GET'])
 @token_required
-def get_pending_links(user_id):
+def get_pending_links(user_id, source_url=None):
     connection = None
     cursor = None
     try:
-        source_url = request.args.get('source_url')
+        # If source_url parameter was not passed to the function, try to get it from request.args
+        if source_url is None:
+            source_url = request.args.get('source_url')
         
         connection = get_oracle_connection()
         cursor = connection.cursor()
@@ -2663,7 +2668,7 @@ def get_pending_links(user_id):
             'status': 'success',
             'pending_links': pending_count,
             'source_url': source_url,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
         })
     except Exception as e:
         print(f"Error getting pending links: {str(e)}")
@@ -2679,11 +2684,13 @@ def get_pending_links(user_id):
 
 @file_api.route('/get-scrapped-links', methods=['GET'])
 @token_required
-def get_scrapped_links(user_id):
+def get_scrapped_links(user_id, source_url=None):
     connection = None
     cursor = None
     try:
-        source_url = request.args.get('source_url')
+        # If source_url parameter was not passed to the function, try to get it from request.args
+        if source_url is None:
+            source_url = request.args.get('source_url')
         
         connection = get_oracle_connection()
         cursor = connection.cursor()
@@ -2706,7 +2713,7 @@ def get_scrapped_links(user_id):
             'status': 'success',
             'scrapped_links': scraped_count,
             'source_url': source_url,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
         })
     except Exception as e:
         print(f"Error getting scraped links: {str(e)}")
@@ -2722,11 +2729,13 @@ def get_scrapped_links(user_id):
 
 @file_api.route('/get-total-words-scrapped', methods=['GET'])
 @token_required
-def get_total_words_scrapped(user_id):
+def get_total_words_scrapped(user_id, source_url=None):
     connection = None
     cursor = None
     try:
-        source_url = request.args.get('source_url')
+        # If source_url parameter was not passed to the function, try to get it from request.args
+        if source_url is None:
+            source_url = request.args.get('source_url')
         
         connection = get_oracle_connection()
         cursor = connection.cursor()
@@ -2753,7 +2762,7 @@ def get_total_words_scrapped(user_id):
             'status': 'success',
             'total_words': total_words,
             'source_url': source_url,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
         })
     except Exception as e:
         print(f"Error getting total words: {str(e)}")
@@ -2769,11 +2778,13 @@ def get_total_words_scrapped(user_id):
 
 @file_api.route('/get-links-to-scrap', methods=['GET'])
 @token_required
-def get_links_to_scrap(user_id):
+def get_links_to_scrap(user_id, source_url=None):
     connection = None
     cursor = None
     try:
-        source_url = request.args.get('source_url')
+        # If source_url parameter was not passed to the function, try to get it from request.args
+        if source_url is None:
+            source_url = request.args.get('source_url')
         
         connection = get_oracle_connection()
         cursor = connection.cursor()
@@ -2797,7 +2808,7 @@ def get_links_to_scrap(user_id):
             'status': 'success',
             'links': links,
             'source_url': source_url,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
         })
     except Exception as e:
         print(f"Error getting links to scrap: {str(e)}")
@@ -2810,6 +2821,7 @@ def get_links_to_scrap(user_id):
             cursor.close()
         if connection:
             connection.close()
+
 
 @file_api.route('/stop-processing', methods=['POST'])
 @token_required
@@ -2824,7 +2836,7 @@ def stop_processing_job(user_id):  # Renamed to avoid conflicts
             return jsonify({
                 'status': 'error',
                 'message': 'source_url is required in the POST body.',
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
             }), 400
                 
         source_url = data['source_url']
@@ -2850,14 +2862,14 @@ def stop_processing_job(user_id):  # Renamed to avoid conflicts
                 'status': 'success',
                 'message': f'Processing for {source_url} has been stopped.',
                 'next_started': start_next,
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
             })
         else:
             print(f"No active processing found for {process_key}")
             return jsonify({
                 'status': 'error',
                 'message': f'No active processing found for {source_url}',
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
             }), 404
                 
     except Exception as e:
@@ -2867,9 +2879,72 @@ def stop_processing_job(user_id):  # Renamed to avoid conflicts
             'status': 'error',
             'message': str(e),
             'traceback': traceback.format_exc(),
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
         }), 500
     
+@file_api.route('/get-discovered-links', methods=['GET'])
+@token_required
+def fetch_discovered_links_v2(user_id, source_url=None):
+    connection = None
+    cursor = None
+    try:
+        # If source_url parameter was not passed to the function, try to get it from request.args
+        if source_url is None:
+            source_url = request.args.get('source_url')
+        
+        connection = get_oracle_connection()
+        cursor = connection.cursor()
+        
+        # Build query with user_id
+        query = """
+            SELECT LINK FROM {0}
+            WHERE USER_ID = :user_id
+        """.format(LINKS_TO_SCRAP_TABLE)
+        
+        params = {'user_id': user_id}
+        
+        if source_url:
+            query += " AND TOP_LEVEL_SOURCE = :source_url"
+            params['source_url'] = source_url
+        
+        # Execute query to get distinct links
+        cursor.execute(f"""
+            SELECT DISTINCT LINK FROM ({query})
+        """, params)
+        
+        discovered_links = [row[0] for row in cursor.fetchall()]
+        
+        # Count by domain
+        domains = {}
+        for link in discovered_links:
+            try:
+                domain = link.split('//', 1)[1].split('/', 1)[0] if '//' in link else link.split('/', 1)[0]
+                domains[domain] = domains.get(domain, 0) + 1
+            except:
+                continue
+        
+        # Convert to list of dictionaries for response
+        domain_stats = [{'domain': domain, 'count': count} for domain, count in domains.items()]
+        
+        return jsonify({
+            'status': 'success',
+            'total_links': len(discovered_links),
+            'domain_stats': domain_stats,
+            'source_url': source_url,
+            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
+        })
+    except Exception as e:
+        print(f"Error getting discovered links: {str(e)}")
+        traceback.print_exc()
+        if connection:
+            connection.rollback()
+        return standardize_error_response(str(e), 'DB_ERROR', 500)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close() 
+
 @file_api.route('/all-documents', methods=['GET'])
 @token_required
 def get_all_documents(user_id):
@@ -2910,6 +2985,15 @@ def get_all_documents(user_id):
             
             processed_count = cursor.fetchone()[0]
             
+            # Count the total number of links for this source URL
+            cursor.execute("""
+                SELECT COUNT(*) FROM {0}
+                WHERE TOP_LEVEL_SOURCE = :source_url
+                AND USER_ID = :user_id
+            """.format(LINKS_TO_SCRAP_TABLE), source_url=source_url, user_id=user_id)
+            
+            total_links = cursor.fetchone()[0]
+            
             # Count the number of scrapped texts for this source URL
             cursor.execute("""
                 SELECT COUNT(*) FROM {0}
@@ -2919,7 +3003,26 @@ def get_all_documents(user_id):
             
             scrapped_count = cursor.fetchone()[0]
             
-            print(f"Source URL: {source_url}, Processed: {processed_count}, Scrapped: {scrapped_count}")
+            # Count the number of failed links for this source URL
+            cursor.execute("""
+                SELECT COUNT(*) FROM {0}
+                WHERE TOP_LEVEL_SOURCE = :source_url
+                AND IS_PROCESSED = 'Failed'
+                AND USER_ID = :user_id
+            """.format(LINKS_TO_SCRAP_TABLE), source_url=source_url, user_id=user_id)
+            
+            failed_count = cursor.fetchone()[0]
+            
+            print(f"Source URL: {source_url}, Processed: {processed_count}, Total: {total_links}, Scrapped: {scrapped_count}, Failed: {failed_count}")
+            
+            # Calculate progress percentages
+            crawl_progress = 0
+            scrape_progress = 0
+            
+            if total_links > 0:
+                # Calculate crawling and scraping progress
+                crawl_progress = round((processed_count + failed_count) / total_links * 100, 1)
+                scrape_progress = round(scrapped_count / total_links * 100, 1)
             
             # Check if this URL is in the queue
             cursor.execute("""
@@ -2929,66 +3032,73 @@ def get_all_documents(user_id):
             """.format(PROCESSING_QUEUE_TABLE), user_id=user_id, source_url=source_url)
             
             queue_count, is_processed, is_processing = cursor.fetchone()
-            queue_item_exists = queue_count > 0
+            in_queue = queue_count > 0
+            queue_position = None
             
             # Determine if this source URL is active
             is_active = False
             if user_id in active_user_jobs and source_url in active_user_jobs[user_id]:
                 is_active = True
             
-            # Determine the status
-            if is_active:
-                status = 'In Progress'
-            elif queue_item_exists and (is_processed == 0 and is_processing is None):
-                # It's in the queue but not yet processing
-                status = 'Queued'
-            elif processed_count > 0 and processed_count == scrapped_count:
-                status = 'Completed'
-            else:
-                status = 'Pending'
-            
-            # Get queue position if applicable
-            queue_position = None
-            if status == 'Queued' and queue_item_exists:
-                # Count how many unprocessed items are ahead in the queue
+            # Get queue position if in queue
+            if in_queue and is_processed == 0 and is_processing is None:
                 cursor.execute("""
                     SELECT COUNT(*) FROM {0} q1
                     WHERE q1.USER_ID = :user_id
-                      AND q1.PROCESSED = 0
-                      AND q1.PROCESSING_STARTED IS NULL
-                      AND q1.ADDED_AT < (
-                          SELECT q2.ADDED_AT FROM {0} q2
-                          WHERE q2.USER_ID = :user_id 
-                            AND q2.SOURCE_URL = :source_url
-                            AND q2.PROCESSED = 0
-                            AND q2.PROCESSING_STARTED IS NULL
-                      )
+                    AND q1.PROCESSED = 0
+                    AND q1.PROCESSING_STARTED IS NULL
+                    AND q1.ADDED_AT < (
+                        SELECT q2.ADDED_AT FROM {0} q2
+                        WHERE q2.USER_ID = :user_id 
+                        AND q2.SOURCE_URL = :source_url
+                        AND q2.PROCESSED = 0
+                        AND q2.PROCESSING_STARTED IS NULL
+                    )
                 """.format(PROCESSING_QUEUE_TABLE), user_id=user_id, source_url=source_url)
                 
                 ahead_count = cursor.fetchone()[0]
-                queue_position = ahead_count + 1  # Add 1 for human-readable position (1-based indexing)
+                queue_position = ahead_count + 1  # 1-based indexing
             
-            # Append the document to the list
-            documents.append({
-                'source_link': source_url,
+            # Determine document status
+            if total_links == 0:
+                status = 'Pending'
+            elif processed_count + failed_count >= total_links:
+                status = 'Completed'
+            elif is_active:
+                status = 'In Progress'
+            elif in_queue and is_processed == 0 and is_processing is None:
+                status = 'Queued'
+            else:
+                status = 'Pending'
+            
+            # Create document object
+            document = {
+                'source_url': source_url,
+                'timestamp': timestamp,
+                'page_limit': page_limit,
                 'status': status,
+                'total_links': total_links,
                 'processed_links': processed_count,
-                'scrapped_texts': scrapped_count,
-                'last_scrapped': timestamp,
-                'queue_position': queue_position,
+                'failed_links': failed_count,
+                'scrapped_links': scrapped_count,
+                'crawl_progress': crawl_progress,
+                'scrape_progress': scrape_progress,
                 'is_active': is_active,
-                'page_limit': page_limit
-            })
+                'in_queue': in_queue,
+                'queue_position': queue_position
+            }
+            
+            documents.append(document)
         
         return jsonify({
             'status': 'success',
             'documents': documents,
-            'has_active_job': user_has_active_job(user_id),
-            'timestamp': datetime.now().isoformat()
+            'count': len(documents),
+            'timestamp': datetime.datetime.now().isoformat()
         })
     
     except Exception as e:
-        print(f"Error fetching all documents: {str(e)}")
+        print(f"Error getting all documents: {str(e)}")
         traceback.print_exc()
         if connection:
             connection.rollback()
@@ -2998,6 +3108,7 @@ def get_all_documents(user_id):
             cursor.close()
         if connection:
             connection.close()
+            
 def standardize_error_response(error, code=None, status_code=500):
     """
     Create a standardized error response
