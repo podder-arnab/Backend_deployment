@@ -88,8 +88,8 @@ def connect_to_vectdb():
             user=ORACLE_USER_VECTDB,
             password=ORACLE_PASSWORD,
             dsn=ORACLE_DSN_VECTDB,
-            config_dir="Wallet_VECTDB_",
-            wallet_location="Wallet_VECTDB_",
+            config_dir="Wallet_VECTDB",
+            wallet_location="Wallet_VECTDB",
             wallet_password=ORACLE_PASSWORD
         )
         print("Connected to Vector Database!")
@@ -155,14 +155,15 @@ def initialize_json_database(jsondb_connection):
         traceback.print_exc()
         return False
 
-def process_scrapped_text_to_vector_store(jsondb_connection, user_id=None, url=None):
+def process_scrapped_text_to_vector_store(jsondb_connection, user_id=None, source_level_url=None):
     """
-    Process scrapped text data from the SCRAPPED_TEXT table to the vector store
+    Process scrapped text data from the SCRAPPED_TEXT table to the vector store,
+    vectorizing ALL documents associated with the given parent source_level_url
     
     Args:
         jsondb_connection: Oracle connection to the JSON database
         user_id: Optional filter by user_id
-        url: Optional filter by url (TOP_LEVEL_SOURCE)
+        source_level_url: Parent URL to filter all child documents by
     
     Returns:
         Dict with status and message
@@ -189,7 +190,7 @@ def process_scrapped_text_to_vector_store(jsondb_connection, user_id=None, url=N
         
         cursor = jsondb_connection.cursor()
         
-        # Build query with filters
+        # Build query based on what we know about the schema from the screenshot
         query = """
             SELECT SCRAPPED_CONTENT, CONTENT_LINK, TOP_LEVEL_SOURCE, TITLE
             FROM SCRAPPED_TEXT
@@ -197,29 +198,43 @@ def process_scrapped_text_to_vector_store(jsondb_connection, user_id=None, url=N
         """
         
         params = {}
+        
+        # If source_level_url is provided, filter by TOP_LEVEL_SOURCE
+        if source_level_url:
+            query += " AND TOP_LEVEL_SOURCE = :source_level_url"
+            params["source_level_url"] = source_level_url
+        
         if user_id:
             query += " AND USER_ID = :user_id"
             params["user_id"] = user_id
-        
-        if url:
-            query += " AND TOP_LEVEL_SOURCE = :url"
-            params["url"] = url
         
         cursor.execute(query, params)
         rows = cursor.fetchall()
         
         if not rows:
-            return {"status": "info", "message": "No scrapped text data found"}
+            return {
+                "status": "info", 
+                "message": f"No scrapped text data found for source_level_url: {source_level_url}"
+            }
         
         # Create documents from scrapped text
         documents = []
         for row in rows:
-            content, link, source, title = row
+            content_lob, link, top_level_source, title = row
+            
+            # Convert Oracle LOB object to string
+            if isinstance(content_lob, oracledb.LOB):
+                content = content_lob.read()
+            else:
+                content = str(content_lob)
+            
+            # Create metadata as a JSON object (matching your vector store schema)
             metadata = {
                 "url": link,
-                "source": source,
+                "source": source_level_url if source_level_url else top_level_source,
                 "title": title
             }
+            
             documents.append(Document(page_content=content, metadata=metadata))
         
         # Split documents into chunks
@@ -236,6 +251,9 @@ def process_scrapped_text_to_vector_store(jsondb_connection, user_id=None, url=N
         BATCH_SIZE = 10
         total_batches = (len(chunks) + BATCH_SIZE - 1) // BATCH_SIZE
         
+        successful_chunks = 0
+        failed_chunks = 0
+        
         for i in range(0, len(chunks), BATCH_SIZE):
             batch = chunks[i:i + BATCH_SIZE]
             batch_num = i // BATCH_SIZE + 1
@@ -243,24 +261,28 @@ def process_scrapped_text_to_vector_store(jsondb_connection, user_id=None, url=N
             try:
                 vector_store.add_documents(batch)
                 print(f"Batch {batch_num}/{total_batches} processed successfully")
+                successful_chunks += len(batch)
             except Exception as e:
                 print(f"Error processing batch {batch_num}: {e}")
                 traceback.print_exc()
+                failed_chunks += len(batch)
             
             # Sleep to avoid rate limits
             time.sleep(2)
         
         return {
             "status": "success", 
-            "message": f"Processed {len(chunks)} chunks from {len(documents)} documents",
+            "message": f"Processed {successful_chunks} chunks from {len(documents)} documents for source_level_url: {source_level_url}",
             "document_count": len(documents),
-            "chunk_count": len(chunks)
+            "successful_chunks": successful_chunks,
+            "failed_chunks": failed_chunks,
+            "source_level_url": source_level_url
         }
     
     except Exception as e:
         print(f"Error processing scrapped text: {e}")
         traceback.print_exc()
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": str(e), "source_level_url": source_level_url}
     finally:
         if vectdb_connection:
             vectdb_connection.close()
@@ -439,15 +461,17 @@ def verify_api_key(api_key):
         return True
     return False
 
-async def process_chat_request(db_conn, message, session_id=None, api_key=None):
+async def process_chat_request(db_conn, message, session_id=None, api_key=None, source_level_url=None):
     """
-    Process a chat request
+    Process a chat request, filtering by source_level_url in the METADATA JSON field
+    with simpler query approach
     
     Args:
         db_conn: Database connection
         message: User message
         session_id: Optional session ID
         api_key: API key for authorization
+        source_level_url: URL to restrict the knowledge retrieval context
         
     Returns:
         ChatResponse object
@@ -458,22 +482,75 @@ async def process_chat_request(db_conn, message, session_id=None, api_key=None):
             raise Exception("Invalid API Key")
         
         # Handle session creation/retrieval
-        if session_id:
-            session = await get_session(db_conn, session_id)
-            if not session:
-                # Session ID was provided but doesn't exist. Create a new one.
-                session_id, title = await create_new_session(db_conn)
-                session = await get_session(db_conn, session_id)
-            else:
-                title = session.get("title", "New Conversation")
-        else:
-            # No session ID provided. Create a new session.
-            session_id, title = await create_new_session(db_conn)
-            session = await get_session(db_conn, session_id)
+        session = None
+        cursor = None
         
-        # Check if session retrieval failed.
+        try:
+            cursor = db_conn.cursor()
+            
+            if session_id:
+                # Try to retrieve the existing session
+                select_query = """
+                SELECT JSON_DATA
+                FROM CHAT_SESSIONS
+                WHERE JSON_VALUE(JSON_DATA, '$.session_id') = :1
+                """
+                cursor.execute(select_query, [session_id])
+                result = cursor.fetchone()
+                
+                if result and result[0]:
+                    # Parse the JSON string into a Python object
+                    session_data = result[0]
+                    if isinstance(session_data, str):
+                        session = json.loads(session_data)
+                    else:
+                        session = session_data
+                    title = session.get("title", "New Conversation")
+                else:
+                    # Session ID was provided but doesn't exist. Create a new one.
+                    title = f"Conversation about {source_level_url}" if source_level_url else "New Conversation"
+                    new_session_id = str(int(time.time()))
+                    new_session = ChatSession(session_id=new_session_id, title=title)
+                    
+                    # Insert the session into the database
+                    insert_query = """
+                    INSERT INTO CHAT_SESSIONS (JSON_DATA)
+                    VALUES (:1)
+                    """
+                    session_json = json.dumps(new_session.to_dict())
+                    cursor.execute(insert_query, (session_json,))
+                    db_conn.commit()
+                    
+                    print(f"New session {new_session_id} created successfully.")
+                    session_id = new_session_id
+                    session = new_session.to_dict()
+            else:
+                # No session ID provided. Create a new session.
+                title = f"Conversation about {source_level_url}" if source_level_url else "New Conversation"
+                new_session_id = str(int(time.time()))
+                new_session = ChatSession(session_id=new_session_id, title=title)
+                
+                # Insert the session into the database
+                insert_query = """
+                INSERT INTO CHAT_SESSIONS (JSON_DATA)
+                VALUES (:1)
+                """
+                session_json = json.dumps(new_session.to_dict())
+                cursor.execute(insert_query, (session_json,))
+                db_conn.commit()
+                
+                print(f"New session {new_session_id} created successfully.")
+                session_id = new_session_id
+                session = new_session.to_dict()
+        finally:
+            if cursor:
+                cursor.close()
+        
+        # Check if session creation/retrieval was successful
         if not session:
-            raise Exception(f"Session not found after creation: {session_id}")
+            raise Exception(f"Unable to create or retrieve session")
+            
+        title = session.get("title", "New Conversation")
         
         # Initialize vector database connection
         vectdb_connection = connect_to_vectdb()
@@ -494,18 +571,88 @@ async def process_chat_request(db_conn, message, session_id=None, api_key=None):
                 distance_strategy=DistanceStrategy.COSINE,
             )
             
-            # Get query embedding and search Oracle Vector Store
-            docs = vector_store.similarity_search(
-                message,
-                k=5  # Number of documents to return
-            )
+            # Get query embedding and search Oracle Vector Store based on source_level_url if provided
+            if source_level_url:
+                print(f"Searching for content related to parent URL: {source_level_url}")
+                
+                # Approach 1: Use the Langchain search but filter the results afterward
+                docs = []
+                
+                try:
+                    # Get general documents
+                    all_docs = vector_store.similarity_search(message, k=20)  # Get more to filter from
+                    
+                    # Filter them by URL
+                    for doc in all_docs:
+                        # Handle LOB objects
+                        if isinstance(doc.page_content, oracledb.LOB):
+                            doc.page_content = doc.page_content.read()
+                        
+                        # Check the metadata for matching URL
+                        metadata = doc.metadata
+                        if isinstance(metadata, dict):
+                            metadata_str = str(metadata)
+                        elif isinstance(metadata, str):
+                            metadata_str = metadata
+                        elif isinstance(metadata, oracledb.LOB):
+                            metadata_str = metadata.read()
+                        else:
+                            metadata_str = str(metadata)
+                        
+                        # If the source_level_url appears in the metadata, include this document
+                        if source_level_url in metadata_str:
+                            docs.append(doc)
+                        
+                    print(f"Found {len(docs)} documents matching {source_level_url} out of {len(all_docs)} total")
+                    
+                    # If not enough matches, include some general docs
+                    if len(docs) < 3:
+                        remaining_slots = 5 - len(docs)
+                        general_docs = [d for d in all_docs if d not in docs][:remaining_slots]
+                        docs.extend(general_docs)
+                        print(f"Added {len(general_docs)} general documents to supplement results")
+                
+                except Exception as e:
+                    print(f"Error in document filtering: {e}")
+                    traceback.print_exc()
+                    # Fall back to standard search
+                    docs = vector_store.similarity_search(message, k=5)
+                    for doc in docs:
+                        if isinstance(doc.page_content, oracledb.LOB):
+                            doc.page_content = doc.page_content.read()
+            else:
+                # Standard search without URL filtering
+                docs = vector_store.similarity_search(message, k=5)
+                
+                # Handle LOB objects
+                for doc in docs:
+                    if isinstance(doc.page_content, oracledb.LOB):
+                        doc.page_content = doc.page_content.read()
             
+            # Extract contents and sources
             contexts = [doc.page_content for doc in docs]
-            sources = [doc.metadata.get("url", "N/A") for doc in docs]
+            sources = []
+            for doc in docs:
+                if isinstance(doc.metadata, dict) and "url" in doc.metadata:
+                    url = doc.metadata["url"]
+                    sources.append(url)
+                elif isinstance(doc.metadata, str):
+                    try:
+                        metadata_dict = json.loads(doc.metadata)
+                        url = metadata_dict.get("url", "N/A")
+                        sources.append(url)
+                    except:
+                        sources.append("N/A")
+                else:
+                    sources.append("N/A")
             
             if not contexts:
+                response_message = "No relevant information found in the knowledge base."
+                if source_level_url:
+                    response_message += f" for the domain: {source_level_url}"
+                
                 response = ChatResponse(
-                    answer="No relevant information found in the knowledge base.",
+                    answer=response_message,
                     sources=[],
                     session_id=session_id,
                     title=title
@@ -522,17 +669,21 @@ async def process_chat_request(db_conn, message, session_id=None, api_key=None):
                 for msg in session.get("messages", [])[-4:] if session.get("messages", [])
             ])
             
-            # Define prompt template
-            prompt_template = """
+            # Define prompt template that acknowledges the parent URL
+            source_context = ""
+            if source_level_url:
+                source_context = f"\nFocus on information specifically from: {source_level_url} and its related pages."
+            
+            prompt_template = f"""
             Previous conversation:
-            {chat_history}
+            {{chat_history}}
 
-            Use the following context to answer the question. Consider the previous conversation for context.
+            Use the following context to answer the question. Consider the previous conversation for context.{source_context}
             If the answer is not in the provided context, say: "Answer is not available in the context."
             Do not provide incorrect information.
 
-            Context: {context}
-            Question: {question}
+            Context: {{context}}
+            Question: {{question}}
             Answer:
             """
             
@@ -557,6 +708,11 @@ async def process_chat_request(db_conn, message, session_id=None, api_key=None):
             )
             
             answer_text = chain_response["output_text"]
+            
+            # If source_level_url is provided and answer was found, add attribution
+            if source_level_url and "Answer is not available in the context" not in answer_text:
+                source_note = f"\n\nThis information is sourced from: {source_level_url} and its related pages."
+                answer_text += source_note
             
             # Update session with new messages
             await update_session(db_conn, session_id, message, answer_text)

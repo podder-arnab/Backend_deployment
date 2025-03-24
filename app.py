@@ -540,6 +540,51 @@ def details_redirect():
     # Reuse source_url_status as details endpoint
     return get_source_url_status(user_id)
 
+@app.route('/chat', methods=['POST', 'OPTIONS'])
+def chatbot_chat():
+    if request.method == 'OPTIONS':
+        return options_route('')
+    
+    # Import the function from chatbot_api
+    from chatbot_api import chat
+    return chat()  # Now chat() is not async, so this works
+
+@app.route('/vectorize', methods=['POST', 'OPTIONS'])
+def chatbot_vectorize():
+    if request.method == 'OPTIONS':
+        return options_route('')
+    
+    # Import the function from chatbot_api
+    from chatbot_api import vectorize_scrapped_text
+    return vectorize_scrapped_text()  # Now vectorize_scrapped_text() is not async, so this works
+
+@app.route('/conversations', methods=['GET', 'OPTIONS'])
+def chatbot_conversations():
+    if request.method == 'OPTIONS':
+        return options_route('')
+    
+    # Import the function from chatbot_api
+    from chatbot_api import get_conversations
+    return get_conversations()  # Now get_conversations() is not async, so this works
+
+@app.route('/conversation/<session_id>', methods=['GET', 'OPTIONS'])
+def chatbot_conversation(session_id):
+    if request.method == 'OPTIONS':
+        return options_route('')
+    
+    # Import the function from chatbot_api
+    from chatbot_api import get_conversation
+    return get_conversation(session_id)  # Now get_conversation() is not async, so this works
+
+@app.route('/conversation/<session_id>/title', methods=['PUT', 'OPTIONS'])
+def chatbot_conversation_title(session_id):
+    if request.method == 'OPTIONS':
+        return options_route('')
+    
+    # Import the function from chatbot_api
+    from chatbot_api import update_conversation_title
+    return update_conversation_title(session_id)  # Now update_conversation_title() is not async, so this works
+
 # Register blueprints
 app.register_blueprint(file_api, url_prefix='/api/files')
 app.register_blueprint(user_api, url_prefix='/api/users')
