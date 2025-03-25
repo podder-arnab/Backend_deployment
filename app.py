@@ -1,10 +1,11 @@
 from flask import Flask, request, jsonify, make_response
 from file_api import file_api
 from user_api import user_api, login_user, register_user
+from chatbot_api import chatbot_api  # Import the chatbot API blueprint
 import os
 import logging
 import jwt
-from datetime import datetime
+import datetime 
 import traceback
 
 # Configure logging
@@ -23,6 +24,28 @@ SECRET_KEY = os.getenv('SECRET_KEY', 'your-secret-key-fallback')
 
 # Create the Flask app
 app = Flask(__name__)
+
+
+# Initialize database connection pools
+from file_api import initialize_connection_pool
+from user_api import initialize_connection_pool as initialize_user_connection_pool
+from oracle_chatbot import connect_to_jsondb, initialize_json_database
+
+# Initialize connection pools
+initialize_connection_pool()
+initialize_user_connection_pool()
+
+# Initialize the chatbot JSON database
+chatbot_jsondb_connection = connect_to_jsondb()
+if chatbot_jsondb_connection:
+    initialize_json_database(chatbot_jsondb_connection)
+    print("Chatbot database initialized successfully")
+else:
+    print("WARNING: Failed to initialize chatbot database connection")
+    
+# Close the connection after initialization
+if chatbot_jsondb_connection:
+    chatbot_jsondb_connection.close()
 
 # Standardized error response function
 def standardize_error_response(error, code=None, status_code=500):
@@ -47,7 +70,7 @@ def standardize_error_response(error, code=None, status_code=500):
     response = {
         'status': 'error',
         'message': error_message,
-        'timestamp': datetime.now().isoformat()
+        'timestamp': datetime.datetime.now().isoformat()
     }
     
     if code:
@@ -67,20 +90,19 @@ def verify_token():
     token = request.headers.get('Authorization')
     
     if not token or not token.startswith("Bearer "):
+        print("Invalid token format")
         return None
 
     token = token.split(" ")[1]
     try:
-        decoded = jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
+        # Use the exact same SECRET_KEY as used in token generation
+        decoded = jwt.decode(token, os.getenv('SECRET_KEY'), algorithms=['HS256'])
         return decoded['user_id']
     except jwt.ExpiredSignatureError:
-        logger.warning("Token verification failed: Token expired")
+        print("Token has expired")
         return None
-    except jwt.InvalidTokenError:
-        logger.warning("Token verification failed: Invalid token")
-        return None
-    except Exception as e:
-        logger.error(f"Token verification error: {str(e)}")
+    except jwt.InvalidTokenError as e:
+        print(f"Invalid Token Error: {e}")
         return None
 
 # Helper function to add CORS headers to responses
@@ -92,6 +114,8 @@ def add_cors_to_response(response):
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With'
         response.headers['Access-Control-Allow-Credentials'] = 'true'
     return response
+
+
 
 # CORS handling for all responses
 @app.after_request
@@ -128,23 +152,11 @@ def auth_login_redirect():
         return options_route('')
     return login_user()
 
-
-
-
 @app.route('/auth/register', methods=['POST', 'OPTIONS'])
 def auth_register_redirect():
     if request.method == 'OPTIONS':
         return options_route('')
     return register_user()
-
-@app.route('/auth/logout', methods=['POST', 'OPTIONS'])
-def auth_logout():
-    if request.method == 'OPTIONS':
-        return options_route('')
-    
-    # Import the function from user_api
-    from user_api import logout_user
-    return logout_user()
 
 @app.route('/auth/get-user-details', methods=['GET', 'OPTIONS'])
 def auth_get_user_details():
@@ -159,17 +171,20 @@ def auth_get_user_details():
     from user_api import get_user_details
     return get_user_details(user_id)
 
-@app.route('/auth/forgot-password', methods=['POST', 'OPTIONS'])
-def auth_forgot_password():
+# File Routes
+@app.route('/recursive-crawl', methods=['POST', 'OPTIONS'])
+def recursive_crawl_redirect():
     if request.method == 'OPTIONS':
         return options_route('')
     
-    # Import the function from user_api
-    from user_api import forgot_password
-    return forgot_password()
+    # Import and call the function from file_api
+    from file_api import recursive_crawl
+    
+    # The decorator will handle authentication and pass user_id
+    return recursive_crawl()
 
-@app.route('/auth/token-refresh', methods=['POST', 'OPTIONS'])
-def auth_token_refresh():
+@app.route('/process-all-links', methods=['POST', 'OPTIONS'])
+def process_all_links_redirect():
     if request.method == 'OPTIONS':
         return options_route('')
     
@@ -177,11 +192,10 @@ def auth_token_refresh():
     if not user_id:
         return standardize_error_response('Unauthorized access. Valid token required.', 'AUTH_REQUIRED', 401)
     
-    # Import the function from user_api
-    from user_api import refresh_token
-    return refresh_token(user_id)
+    # Import and call the function from file_api
+    from file_api import process_all_links
+    return process_all_links(user_id)
 
-# Dashboard Routes
 @app.route('/all-documents', methods=['GET', 'OPTIONS'])
 def all_documents_redirect():
     if request.method == 'OPTIONS':
@@ -191,10 +205,8 @@ def all_documents_redirect():
     if not user_id:
         return standardize_error_response('Unauthorized access. Valid token required.', 'AUTH_REQUIRED', 401)
     
-    # Import here to avoid circular imports
+    # Import and call the function from file_api
     from file_api import get_all_documents
-    
-    # Pass user_id explicitly
     return get_all_documents(user_id)
 
 @app.route('/get-discovered-links', methods=['GET', 'OPTIONS'])
@@ -212,39 +224,20 @@ def discovered_links_redirect():
     # Import and call the function from file_api
     from file_api import get_discovered_links
     
-    # Pass user_id explicitly
     if source_url:
         return get_discovered_links(user_id, source_url=source_url)
     else:
         return get_discovered_links(user_id)
-
-@app.route('/scrapped-sub-links', methods=['GET', 'POST', 'OPTIONS'])
+    
+@app.route('/scrapped-sub-links', methods=['POST', 'OPTIONS'])
 def scrapped_sub_links_redirect():
     if request.method == 'OPTIONS':
         return options_route('')
-    
-    # Import the function
+    user_id = verify_token()
+    if not user_id:
+        return standardize_error_response('Unauthorized access. Valid token required.', 'AUTH_REQUIRED', 401)
     from file_api import scrapped_sub_links
-    
-    # Call the function directly - no auth needed for this endpoint
     return scrapped_sub_links()
-
-@app.route('/progress-bar', methods=['GET', 'OPTIONS'])
-def progress_bar_redirect():
-    if request.method == 'OPTIONS':
-        return options_route('')
-    
-    # Get the source_url parameter
-    source_url = request.args.get('source_url')
-    
-    if not source_url:
-        return standardize_error_response('source_url parameter is required.', 'MISSING_PARAM', 400)
-    
-    # Import and call the function from file_api
-    from file_api import get_progress_bar
-    
-    # Call with source_url parameter
-    return get_progress_bar()
 
 @app.route('/source-url-status', methods=['GET', 'OPTIONS'])
 def source_url_status_redirect():
@@ -263,344 +256,12 @@ def source_url_status_redirect():
     
     # Import and call the function from file_api
     from file_api import get_source_url_status
-    
-    # Don't pass user_id explicitly - let the decorator handle it
-    return get_source_url_status()
-
-@app.route('/queue-status', methods=['GET', 'OPTIONS'])
-def queue_status_redirect():
-    if request.method == 'OPTIONS':
-        return options_route('')
-    
-    user_id = verify_token()
-    if not user_id:
-        return standardize_error_response('Unauthorized access. Valid token required.', 'AUTH_REQUIRED', 401)
-    
-    # Import and call the function from file_api
-    from file_api import get_queue_status
-    
-    # Pass user_id explicitly
-    return get_queue_status(user_id)
-
-@app.route('/recursive-crawl', methods=['POST', 'OPTIONS'])
-def recursive_crawl_redirect():
-    if request.method == 'OPTIONS':
-        return options_route('')
-    
-    user_id = verify_token()
-    if not user_id:
-        return standardize_error_response('Unauthorized access. Valid token required.', 'AUTH_REQUIRED', 401)
-    
-    # Import and call the function from file_api
-    from file_api import recursive_crawl
-    
-    # DON'T pass user_id explicitly - let the decorator handle it
-    return recursive_crawl()
-
-@app.route('/process-all-links', methods=['POST', 'OPTIONS'])
-def process_all_links_redirect():
-    if request.method == 'OPTIONS':
-        return options_route('')
-    
-    user_id = verify_token()
-    if not user_id:
-        return standardize_error_response('Unauthorized access. Valid token required.', 'AUTH_REQUIRED', 401)
-    
-    # Import and call the function from file_api
-    from file_api import process_all_links
-    
-    # DON'T pass user_id explicitly - let the decorator handle it
-    return process_all_links()
-
-@app.route('/stop-crawling', methods=['POST', 'OPTIONS'])
-def stop_crawling_redirect():
-    if request.method == 'OPTIONS':
-        return options_route('')
-    
-    user_id = verify_token()
-    if not user_id:
-        return standardize_error_response('Unauthorized access. Valid token required.', 'AUTH_REQUIRED', 401)
-    
-    # Import and call the function from file_api
-    from file_api import stop_crawling
-    
-    # Pass user_id explicitly
-    return stop_crawling(user_id)
-
-@app.route('/stop-processing', methods=['POST', 'OPTIONS'])
-def stop_processing_redirect():
-    if request.method == 'OPTIONS':
-        return options_route('')
-    
-    user_id = verify_token()
-    if not user_id:
-        return standardize_error_response('Unauthorized access. Valid token required.', 'AUTH_REQUIRED', 401)
-    
-    # Import and call the function from file_api
-    from file_api import stop_processing_job
-    
-    # Pass user_id explicitly
-    return stop_processing_job(user_id)
-
-@app.route('/remove-from-queue', methods=['POST', 'OPTIONS'])
-def remove_from_queue_redirect():
-    if request.method == 'OPTIONS':
-        return options_route('')
-    
-    user_id = verify_token()
-    if not user_id:
-        return standardize_error_response('Unauthorized access. Valid token required.', 'AUTH_REQUIRED', 401)
-    
-    # Import and call the function from file_api
-    from file_api import remove_from_queue
-    
-    # Pass user_id explicitly
-    return remove_from_queue(user_id)
-
-# Real-time Stats API routes
-@app.route('/realtime-stats/links-to-scrap', methods=['GET', 'OPTIONS'])
-def realtime_links_to_scrap():
-    if request.method == 'OPTIONS':
-        return options_route('')
-    
-    user_id = verify_token()
-    if not user_id:
-        return standardize_error_response('Unauthorized access. Valid token required.', 'AUTH_REQUIRED', 401)
-    
-    source_url = request.args.get('source_url')
-    
-    # Import and call the function from file_api
-    from file_api import get_links_to_scrap
-    
-    # Pass user_id explicitly
-    return get_links_to_scrap(user_id)
-
-@app.route('/realtime-stats/total-processed-links', methods=['GET', 'OPTIONS'])
-def realtime_total_processed_links():
-    if request.method == 'OPTIONS':
-        return options_route('')
-    
-    user_id = verify_token()
-    if not user_id:
-        return standardize_error_response('Unauthorized access. Valid token required.', 'AUTH_REQUIRED', 401)
-    
-    source_url = request.args.get('source_url')
-    
-    # Import and call the function from file_api
-    from file_api import get_total_processed_links
-    
-    # Pass user_id explicitly and source_url if provided
-    if source_url:
-        return get_total_processed_links(user_id, source_url=source_url)
-    else:
-        return get_total_processed_links(user_id)
-
-@app.route('/realtime-stats/scrapped-links', methods=['GET', 'OPTIONS'])
-def realtime_scrapped_links():
-    if request.method == 'OPTIONS':
-        return options_route('')
-    
-    user_id = verify_token()
-    if not user_id:
-        return standardize_error_response('Unauthorized access. Valid token required.', 'AUTH_REQUIRED', 401)
-    
-    source_url = request.args.get('source_url')
-    
-    # Import and call the function from file_api
-    from file_api import get_scrapped_links
-    
-    # Pass user_id explicitly and source_url if provided
-    if source_url:
-        return get_scrapped_links(user_id, source_url=source_url)
-    else:
-        return get_scrapped_links(user_id)
-
-@app.route('/realtime-stats/pending-links', methods=['GET', 'OPTIONS'])
-def realtime_pending_links():
-    if request.method == 'OPTIONS':
-        return options_route('')
-    
-    user_id = verify_token()
-    if not user_id:
-        return standardize_error_response('Unauthorized access. Valid token required.', 'AUTH_REQUIRED', 401)
-    
-    source_url = request.args.get('source_url')
-    
-    # Import and call the function from file_api
-    from file_api import get_pending_links
-    
-    # Pass user_id explicitly and source_url if provided
-    if source_url:
-        return get_pending_links(user_id, source_url=source_url)
-    else:
-        return get_pending_links(user_id)
-
-@app.route('/realtime-stats/total-words-scrapped', methods=['GET', 'OPTIONS'])
-def realtime_total_words_scrapped():
-    if request.method == 'OPTIONS':
-        return options_route('')
-    
-    user_id = verify_token()
-    if not user_id:
-        return standardize_error_response('Unauthorized access. Valid token required.', 'AUTH_REQUIRED', 401)
-    
-    source_url = request.args.get('source_url')
-    
-    # Import and call the function from file_api
-    from file_api import get_total_words_scrapped
-    
-    # Pass user_id explicitly and source_url if provided
-    if source_url:
-        return get_total_words_scrapped(user_id, source_url=source_url)
-    else:
-        return get_total_words_scrapped(user_id)
-
-# Handle for compatibility with old frontend routes
-@app.route('/scrapped-links', methods=['GET', 'OPTIONS'])
-def scrapped_links_redirect():
-    if request.method == 'OPTIONS':
-        return options_route('')
-    
-    user_id = verify_token()
-    if not user_id:
-        return standardize_error_response('Unauthorized access. Valid token required.', 'AUTH_REQUIRED', 401)
-    
-    # Get the source_url parameter
-    source_url = request.args.get('source_url')
-    
-    # Import and call the function from file_api
-    from file_api import get_scrapped_links
-    
-    # Pass user_id explicitly and source_url if provided
-    if source_url:
-        return get_scrapped_links(user_id, source_url=source_url)
-    else:
-        return get_scrapped_links(user_id)
-
-@app.route('/pending-links', methods=['GET', 'OPTIONS'])
-def pending_links_redirect():
-    if request.method == 'OPTIONS':
-        return options_route('')
-    
-    user_id = verify_token()
-    if not user_id:
-        return standardize_error_response('Unauthorized access. Valid token required.', 'AUTH_REQUIRED', 401)
-    
-    # Get the source_url parameter
-    source_url = request.args.get('source_url')
-    
-    # Import and call the function from file_api
-    from file_api import get_pending_links
-    
-    # Pass user_id explicitly and source_url if provided
-    if source_url:
-        return get_pending_links(user_id, source_url=source_url)
-    else:
-        return get_pending_links(user_id)
-
-@app.route('/total-words-scrapped', methods=['GET', 'OPTIONS'])
-def total_words_scrapped_redirect():
-    if request.method == 'OPTIONS':
-        return options_route('')
-    
-    user_id = verify_token()
-    if not user_id:
-        return standardize_error_response('Unauthorized access. Valid token required.', 'AUTH_REQUIRED', 401)
-    
-    # Get the source_url parameter
-    source_url = request.args.get('source_url')
-    
-    # Import and call the function from file_api
-    from file_api import get_total_words_scrapped
-    
-    # Pass user_id explicitly and source_url if provided
-    if source_url:
-        return get_total_words_scrapped(user_id, source_url=source_url)
-    else:
-        return get_total_words_scrapped(user_id)
-
-@app.route('/details', methods=['GET', 'OPTIONS'])
-def details_redirect():
-    if request.method == 'OPTIONS':
-        return options_route('')
-    
-    user_id = verify_token()
-    if not user_id:
-        return standardize_error_response('Unauthorized access. Valid token required.', 'AUTH_REQUIRED', 401)
-    
-    # Get the source_url parameter
-    source_url = request.args.get('source_url')
-    
-    if not source_url:
-        return standardize_error_response('source_url parameter is required.', 'MISSING_PARAM', 400)
-    
-    # Import and call the function from file_api
-    from file_api import get_source_url_status
-    
-    # Reuse source_url_status as details endpoint
-    return get_source_url_status(user_id)
-
-@app.route('/chat', methods=['POST', 'OPTIONS'])
-def chatbot_chat():
-    if request.method == 'OPTIONS':
-        return options_route('')
-    
-    # Import the function from chatbot_api
-    from chatbot_api import chat
-    return chat()  # Now chat() is not async, so this works
-
-@app.route('/vectorize', methods=['POST', 'OPTIONS'])
-def chatbot_vectorize():
-    if request.method == 'OPTIONS':
-        return options_route('')
-    
-    # Import the function from chatbot_api
-    from chatbot_api import vectorize_scrapped_text
-    return vectorize_scrapped_text()  # Now vectorize_scrapped_text() is not async, so this works
-
-@app.route('/conversations', methods=['GET', 'OPTIONS'])
-def chatbot_conversations():
-    if request.method == 'OPTIONS':
-        return options_route('')
-    
-    # Import the function from chatbot_api
-    from chatbot_api import get_conversations
-    return get_conversations()  # Now get_conversations() is not async, so this works
-
-@app.route('/conversation/<session_id>', methods=['GET', 'OPTIONS'])
-def chatbot_conversation(session_id):
-    if request.method == 'OPTIONS':
-        return options_route('')
-    
-    # Import the function from chatbot_api
-    from chatbot_api import get_conversation
-    return get_conversation(session_id)  # Now get_conversation() is not async, so this works
-
-@app.route('/conversation/<session_id>/title', methods=['PUT', 'OPTIONS'])
-def chatbot_conversation_title(session_id):
-    if request.method == 'OPTIONS':
-        return options_route('')
-    
-    # Import the function from chatbot_api
-    from chatbot_api import update_conversation_title
-    return update_conversation_title(session_id)  # Now update_conversation_title() is not async, so this works
+    return get_source_url_status(user_id, source_url)
 
 # Register blueprints
 app.register_blueprint(file_api, url_prefix='/api/files')
 app.register_blueprint(user_api, url_prefix='/api/users')
-
-# Try to register chatbot_api if it exists
-try:
-    from chatbot_api import chatbot_api
-    app.register_blueprint(chatbot_api, url_prefix='/api/chatbot')
-    logger.info("Registered chatbot_api blueprint")
-except ImportError:
-    logger.info("chatbot_api not available, skipping registration")
-
-# Log all registered routes
-logger.info("Registered routes:")
-for rule in app.url_map.iter_rules():
-    logger.info(f"Route: {rule}, Methods: {rule.methods}")
+app.register_blueprint(chatbot_api, url_prefix='/api/chatbot')  # Register the chatbot API blueprint
 
 # Error handlers
 @app.errorhandler(404)

@@ -1,7 +1,7 @@
 from flask import Blueprint, request, jsonify
 from functools import wraps
 import jwt
-from datetime import datetime
+from datetime import datetime,timedelta
 import traceback
 import oracledb  # Make sure this is installed
 from dotenv import load_dotenv
@@ -15,11 +15,18 @@ import json
 import validators
 from threading import Lock, Thread, Event
 from contextlib import contextmanager
+from threading import Thread, Event
+
 
 # Load environment variables from .env file
 load_dotenv()
 
 file_api = Blueprint('file_api', __name__)
+
+# Global variables to track processing state
+processing_events = {}
+crawling_events = {}
+active_user_jobs = {}  # Track which users have active jobs
 
 # Oracle Database connection configuration
 ORACLE_USER = os.environ.get('ORACLE_USER', 'VECTOR')
@@ -35,45 +42,32 @@ PROCESSING_QUEUE_TABLE = 'PROCESSING_QUEUE'
 SOURCE_URLS_TABLE = 'SOURCE_URLS'
 PROGRESS_HISTORY_TABLE = 'PROGRESS_HISTORY'
 
+
+
 # Global variables to track processing state
 processing_events = {}
 crawling_events = {}
 active_user_jobs = {}  # Track which users have active jobs
 
-def get_oracle_connection():
-    """Establish connection to Oracle Database"""
-    try:
-        connection = oracledb.connect(
-            user=ORACLE_USER,
-            password=ORACLE_PASSWORD,
-            dsn=ORACLE_DSN,
-            config_dir="Wallet_jsondb",
-            wallet_location="Wallet_jsondb",
-            wallet_password=ORACLE_PASSWORD
-        )
-        return connection
-    except Exception as e:
-        print(f"Error connecting to Oracle DB: {e}")
-        traceback.print_exc()
-        raise
-# At the top of file_api.py
-# Configure connection pool settings
-
+# Connection pool configuration
 MAX_RETRIES = 3
 RETRY_DELAY = 1
 connection_pool = None
 
 def initialize_connection_pool():
-    """Initialize Oracle connection pool"""
+    """Initialize Oracle connection pool only if it doesn't exist"""
     global connection_pool
+    if connection_pool is not None:
+        return True
+    
     try:
         connection_pool = oracledb.create_pool(
             user=ORACLE_USER,
             password=ORACLE_PASSWORD,
             dsn=ORACLE_DSN,
-            min=2,
-            max=10,
-            increment=1,
+            min=5,           # Increase minimum connections
+            max=30,          # Increase maximum connections
+            increment=5,     # Increase increment for better scalability
             wait_timeout=1000,
             max_lifetime_session=28800,
             config_dir="Wallet_jsondb",
@@ -89,195 +83,221 @@ def initialize_connection_pool():
 
 @contextmanager
 def get_db_connection():
-    """Context manager for database connections with retry logic"""
+    """Context manager for Oracle DB connections"""
     conn = None
-    retries = 0
-    
-    while retries < MAX_RETRIES:
-        try:
-            global connection_pool
-            if connection_pool is None:
-                initialize_connection_pool()
-                
-            if connection_pool:
-                conn = connection_pool.acquire()
-            else:
-                # Fallback to direct connection if pool fails
-                conn = oracledb.connect(
-                    user=ORACLE_USER,
-                    password=ORACLE_PASSWORD,
-                    dsn=ORACLE_DSN,
-                    config_dir="Wallet_jsondb",
-                    wallet_location="Wallet_jsondb",
-                    wallet_password=ORACLE_PASSWORD
-                )
-                
-            yield conn
-            return
-        except oracledb.DatabaseError as e:
-            retries += 1
-            print(f"Database connection attempt {retries} failed: {e}")
+    try:
+        global connection_pool
+        if connection_pool is None:
+            initialize_connection_pool()
             
-            if conn:
-                try:
-                    conn.close()
-                except:
-                    pass
-                    
-            # Wait before retrying with exponential backoff
-            wait_time = RETRY_DELAY * (2 ** (retries - 1))
-            time.sleep(wait_time)
-        except Exception as e:
-            print(f"Unexpected error getting connection: {e}")
-            traceback.print_exc()
-            
-            if conn:
-                try:
-                    conn.close()
-                except:
-                    pass
-            
-            raise
-            
-    # If we reach here, all retries failed
-    raise Exception(f"Failed to establish database connection after {MAX_RETRIES} attempts")
+        if connection_pool:
+            conn = connection_pool.acquire()
+        else:
+            conn = oracledb.connect(
+                user=ORACLE_USER,
+                password=ORACLE_PASSWORD,
+                dsn=ORACLE_DSN,
+                config_dir="Wallet_jsondb",
+                wallet_location="Wallet_jsondb",
+                wallet_password=ORACLE_PASSWORD
+            )
+        yield conn
+    except oracledb.DatabaseError as e:
+        print(f"Database connection error: {e}")
+        traceback.print_exc()
+        raise
+    finally:
+        if conn:
+            conn.close()
+
 
 def initialize_tables():
-    """Initialize all necessary tables if they don't exist"""
-    connection = None
-    cursor = None
-    
+    """Initialize all necessary tables if they don't exist with optimized indexes"""
     try:
-        connection = get_oracle_connection()
-        cursor = connection.cursor()
-        
-        # Map of table names to their creation SQL
-        tables = {
-            CONTENT_LINKS_TABLE: """
-                CREATE TABLE {0} (
-                    ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                    SOURCE_URL VARCHAR2(2000) NOT NULL,
-                    UNIQUE_LINKS CLOB CHECK (UNIQUE_LINKS IS JSON),
-                    CRAWLED_AT TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    DEPTH NUMBER DEFAULT 0,
-                    TOP_LEVEL_SOURCE VARCHAR2(2000),
-                    USER_ID VARCHAR2(50)
-                )
-            """,
-            
-                LINKS_TO_SCRAP_TABLE: """
-                    CREATE TABLE {0} (
-                        ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                        LINK VARCHAR2(2000) NOT NULL,
-                        ADDED_AT TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        IS_CRAWLED NUMBER(1) DEFAULT 0,
-                        IS_PROCESSED VARCHAR2(20) DEFAULT 'false',
-                        SOURCE_URL VARCHAR2(2000),
-                        TOP_LEVEL_SOURCE VARCHAR2(2000),
-                        DEPTH NUMBER DEFAULT 0,
-                        PROCESSED_AT TIMESTAMP,
-                        HAS_TEXT_IN_URL NUMBER(1) DEFAULT 0,
-                        USER_ID VARCHAR2(50),
-                        CRAWLING_STARTED TIMESTAMP,
-                        CRAWLED_AT TIMESTAMP,
-                        LINKS_FOUND NUMBER,
-                        LINKS_ADDED NUMBER,
-                        ERROR CLOB,
-                        TRACEBACK CLOB,
-                        SKIPPED NUMBER(1) DEFAULT 0,
-                        SKIP_REASON VARCHAR2(100),
-                        CONSTRAINT UQ_LINK_USER UNIQUE (LINK, USER_ID)
-                    )
-                """,
-            
-            SCRAPPED_TEXT_TABLE: """
-                CREATE TABLE {0} (
-                    ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                    SCRAPPED_CONTENT CLOB,
-                    CONTENT_LINK VARCHAR2(2000) NOT NULL,
-                    SCRAPE_DATE TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    LINK_ID NUMBER,
-                    SOURCE_URL VARCHAR2(2000),
-                    TOP_LEVEL_SOURCE VARCHAR2(2000),
-                    DEPTH NUMBER DEFAULT 0,
-                    TITLE VARCHAR2(1000),
-                    USER_ID VARCHAR2(50),
-                    CONSTRAINT UQ_CONTENT_LINK_USER UNIQUE (CONTENT_LINK, USER_ID)
-                )
-            """,
-            
-            PROCESSING_QUEUE_TABLE: """
-                CREATE TABLE {0} (
-                    ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                    USER_ID VARCHAR2(50) NOT NULL,
-                    SOURCE_URL VARCHAR2(2000) NOT NULL,
-                    ADDED_AT TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PROCESSED NUMBER(1) DEFAULT 0,
-                    PROCESSING_STARTED TIMESTAMP,
-                    PROCESSING_COMPLETED TIMESTAMP,
-                    PAGE_LIMIT NUMBER DEFAULT 10,
-                    CONSTRAINT UQ_USER_SOURCE UNIQUE (USER_ID, SOURCE_URL)
-                )
-            """,
-            
-            SOURCE_URLS_TABLE: """
-            CREATE TABLE {0} (
-                ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                SOURCE_URL VARCHAR2(2000) NOT NULL,
-                USER_ID VARCHAR2(50),
-                TIMESTAMP TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PAGE_LIMIT NUMBER DEFAULT 10
-            )
-        """,
-            
-
-        }
-        
-        # Check and create each table if it doesn't exist
-        for table_name, create_sql in tables.items():
-            cursor.execute(f"""
-                SELECT COUNT(*) 
-                FROM USER_TABLES
-                WHERE TABLE_NAME = '{table_name}'
-            """)
-            
-            if cursor.fetchone()[0] == 0:
-                cursor.execute(create_sql.format(table_name))
-                print(f"Created table {table_name}")
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                # Map of table names to their creation SQL (unchanged)
+                tables = {
+                    CONTENT_LINKS_TABLE: """
+                        CREATE TABLE {0} (
+                            ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                            SOURCE_URL VARCHAR2(2000) NOT NULL,
+                            UNIQUE_LINKS CLOB CHECK (UNIQUE_LINKS IS JSON),
+                            CRAWLED_AT TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            DEPTH NUMBER DEFAULT 0,
+                            TOP_LEVEL_SOURCE VARCHAR2(2000),
+                            USER_ID VARCHAR2(50)
+                        )
+                    """,
+                    
+                    LINKS_TO_SCRAP_TABLE: """
+                        CREATE TABLE {0} (
+                            ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                            LINK VARCHAR2(2000) NOT NULL,
+                            ADDED_AT TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            IS_CRAWLED NUMBER(1) DEFAULT 0,
+                            IS_PROCESSED VARCHAR2(20) DEFAULT 'false',
+                            SOURCE_URL VARCHAR2(2000),
+                            TOP_LEVEL_SOURCE VARCHAR2(2000),
+                            DEPTH NUMBER DEFAULT 0,
+                            PROCESSED_AT TIMESTAMP,
+                            HAS_TEXT_IN_URL NUMBER(1) DEFAULT 0,
+                            USER_ID VARCHAR2(50),
+                            CRAWLING_STARTED TIMESTAMP,
+                            CRAWLED_AT TIMESTAMP,
+                            LINKS_FOUND NUMBER,
+                            LINKS_ADDED NUMBER,
+                            ERROR CLOB,
+                            TRACEBACK CLOB,
+                            SKIPPED NUMBER(1) DEFAULT 0,
+                            SKIP_REASON VARCHAR2(100),
+                            CONSTRAINT UQ_LINK_USER UNIQUE (LINK, USER_ID)
+                        )
+                    """,
+                    
+                    SCRAPPED_TEXT_TABLE: """
+                        CREATE TABLE {0} (
+                            ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                            SCRAPPED_CONTENT CLOB,
+                            CONTENT_LINK VARCHAR2(2000) NOT NULL,
+                            SCRAPE_DATE TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            LINK_ID NUMBER,
+                            SOURCE_URL VARCHAR2(2000),
+                            TOP_LEVEL_SOURCE VARCHAR2(2000),
+                            DEPTH NUMBER DEFAULT 0,
+                            TITLE VARCHAR2(1000),
+                            USER_ID VARCHAR2(50),
+                            WORD_COUNT NUMBER DEFAULT 0,
+                            CONSTRAINT UQ_CONTENT_LINK_USER UNIQUE (CONTENT_LINK, USER_ID)
+                        )
+                    """,
+                    
+                    PROCESSING_QUEUE_TABLE: """
+                        CREATE TABLE {0} (
+                            ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                            USER_ID VARCHAR2(50) NOT NULL,
+                            SOURCE_URL VARCHAR2(2000) NOT NULL,
+                            ADDED_AT TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            PROCESSED NUMBER(1) DEFAULT 0,
+                            PROCESSING_STARTED TIMESTAMP,
+                            PROCESSING_COMPLETED TIMESTAMP,
+                            PAGE_LIMIT NUMBER DEFAULT 10,
+                            CONSTRAINT UQ_USER_SOURCE UNIQUE (USER_ID, SOURCE_URL)
+                        )
+                    """,
+                    
+                    SOURCE_URLS_TABLE: """
+                        CREATE TABLE {0} (
+                            ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                            SOURCE_URL VARCHAR2(2000) NOT NULL,
+                            USER_ID VARCHAR2(50),
+                            TIMESTAMP TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            PAGE_LIMIT NUMBER DEFAULT 10
+                        )
+                    """,
+                    PROGRESS_HISTORY_TABLE: """
+                        CREATE TABLE {0} (
+                            ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                            SOURCE_URL VARCHAR2(2000) NOT NULL,
+                            TIMESTAMP TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            CRAWL_PROGRESS NUMBER(5,2),
+                            SCRAPE_PROGRESS NUMBER(5,2),
+                            CRAWLED_COUNT NUMBER,
+                            SCRAPED_COUNT NUMBER,
+                            TOTAL_LINKS NUMBER,
+                            OPERATION_STATUS VARCHAR2(50)
+                        )
+                      """
+                }
                 
-                # Create necessary indexes
-                if table_name == LINKS_TO_SCRAP_TABLE:
-                    # Create index on common search fields
+                # Check and create each table if it doesn't exist
+                for table_name, create_sql in tables.items():
                     cursor.execute(f"""
-                        CREATE INDEX IDX_{table_name}_TOP_LEVEL 
-                        ON {table_name} (TOP_LEVEL_SOURCE, USER_ID, IS_CRAWLED)
+                        SELECT COUNT(*) 
+                        FROM USER_TABLES
+                        WHERE TABLE_NAME = '{table_name}'
                     """)
-                    cursor.execute(f"""
-                        CREATE INDEX IDX_{table_name}_PROCESSING 
-                        ON {table_name} (TOP_LEVEL_SOURCE, USER_ID, IS_PROCESSED)
-                    """)
-                elif table_name == PROCESSING_QUEUE_TABLE:
-                    # Create index for queue processing
-                    cursor.execute(f"""
-                        CREATE INDEX IDX_{table_name}_QUEUE 
-                        ON {table_name} (USER_ID, PROCESSED, PROCESSING_STARTED, ADDED_AT)
-                    """)
+                    
+                    if cursor.fetchone()[0] == 0:
+                        cursor.execute(create_sql.format(table_name))
+                        print(f"Created table {table_name}")
+                        
+                        # Create necessary indexes with improved structure
+                        if table_name == LINKS_TO_SCRAP_TABLE:
+                            # Create optimized index on common search fields
+                            cursor.execute(f"""
+                                CREATE INDEX IDX_{table_name}_TOP_LEVEL 
+                                ON {table_name} (TOP_LEVEL_SOURCE, USER_ID, IS_CRAWLED)
+                            """)
+                            cursor.execute(f"""
+                                CREATE INDEX IDX_{table_name}_PROCESSING 
+                                ON {table_name} (TOP_LEVEL_SOURCE, USER_ID, IS_PROCESSED)
+                            """)
+                            cursor.execute(f"""
+                                CREATE INDEX IDX_{table_name}_LINK_USER
+                                ON {table_name} (LINK, USER_ID)
+                            """)
+                            # New optimized indexes
+                            cursor.execute(f"""
+                                CREATE INDEX IDX_{table_name}_CRAWL_QUEUE 
+                                ON {table_name} (IS_CRAWLED, TOP_LEVEL_SOURCE, USER_ID, DEPTH, ADDED_AT)
+                            """)
+                            cursor.execute(f"""
+                                CREATE INDEX IDX_{table_name}_PROCESS_QUEUE 
+                                ON {table_name} (IS_PROCESSED, TOP_LEVEL_SOURCE, USER_ID)
+                            """)
+                        elif table_name == PROCESSING_QUEUE_TABLE:
+                            # Create optimized index for queue processing
+                            cursor.execute(f"""
+                                CREATE INDEX IDX_{table_name}_QUEUE 
+                                ON {table_name} (USER_ID, PROCESSED, PROCESSING_STARTED, ADDED_AT)
+                            """)
+                        elif table_name == SCRAPPED_TEXT_TABLE:
+                            # Add index for content lookups
+                            cursor.execute(f"""
+                                CREATE INDEX IDX_{table_name}_SOURCE 
+                                ON {table_name} (TOP_LEVEL_SOURCE, USER_ID)
+                            """)
+                            # Add index for word count
+                            cursor.execute(f"""
+                                CREATE INDEX IDX_{table_name}_WORD_COUNT 
+                                ON {table_name} (WORD_COUNT)
+                            """)
+                    else:
+                        # If SCRAPPED_TEXT table already exists, check for WORD_COUNT column
+                        if table_name == SCRAPPED_TEXT_TABLE:
+                            cursor.execute("""
+                                SELECT COUNT(*) FROM USER_TAB_COLUMNS 
+                                WHERE TABLE_NAME = 'SCRAPPED_TEXT' AND COLUMN_NAME = 'WORD_COUNT'
+                            """)
+                            
+                            column_exists = cursor.fetchone()[0] > 0
+                            
+                            if not column_exists:
+                                # Add the WORD_COUNT column to an existing table
+                                cursor.execute("""
+                                    ALTER TABLE SCRAPPED_TEXT 
+                                    ADD WORD_COUNT NUMBER DEFAULT 0
+                                """)
+                                
+                                # Create index for the new column
+                                cursor.execute(f"""
+                                    CREATE INDEX IDX_{table_name}_WORD_COUNT 
+                                    ON {table_name} (WORD_COUNT)
+                                """)
+                                
+                                print(f"Added WORD_COUNT column to existing SCRAPPED_TEXT table")
                 
-        connection.commit()
-        print("Database tables initialized successfully")
+                connection.commit()
+                print("Database tables initialized successfully")
     except Exception as e:
         print(f"Error initializing tables: {e}")
         traceback.print_exc()
-        if connection:
-            connection.rollback()
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
 
 # Initialize tables on module load
 initialize_tables()
+
+
 
 def verify_token():
     """Verify JWT token and get user_id"""
@@ -296,17 +316,55 @@ def verify_token():
         return None
 
 # Authentication decorator
-def token_required(fn):
+def token_required(f):
+    """Decorator for verifying JWT tokens"""
+    @wraps(f)
     def wrapper(*args, **kwargs):
-        user_id = verify_token()
-        if not user_id:
+        token = request.headers.get('Authorization')
+        
+        if not token or not token.startswith("Bearer "):
+            print("No valid token found in decorator")
             return jsonify({
                 'status': 'error',
                 'message': 'Unauthorized access. Valid token required.',
-                'timestamp': datetime.now().isoformat()  # Fixed datetime usage
+                'timestamp': datetime.now().isoformat()
             }), 401
-        return fn(user_id, *args, **kwargs)
-    wrapper.__name__ = fn.__name__
+
+        token = token.split(" ")[1]
+        
+        try:
+            decoded = jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
+            user_id = decoded['user_id']
+            print(f"Token verified for user_id: {user_id}")
+            
+            # If the function expects only one argument (user_id)
+            if f.__code__.co_argcount == 1:
+                return f(user_id)
+            
+            # If the function can handle multiple arguments
+            return f(user_id, *args, **kwargs)
+        except jwt.ExpiredSignatureError:
+            print("Token has expired")
+            return jsonify({
+                'status': 'error',
+                'message': 'Token has expired',
+                'timestamp': datetime.now().isoformat()
+            }), 401
+        except jwt.InvalidTokenError:
+            print("Invalid token")
+            return jsonify({
+                'status': 'error',
+                'message': 'Invalid token',
+                'timestamp': datetime.now().isoformat()
+            }), 401
+        except Exception as e:
+            print(f"Token verification error: {str(e)}")
+            return jsonify({
+                'status': 'error',
+                'message': 'Authentication failed',
+                'timestamp': datetime.now().isoformat()
+            }), 401
+            
     return wrapper
 
 def is_valid_url(url):
@@ -317,20 +375,6 @@ def is_valid_url(url):
         # Some URLs might cause validators to raise exceptions
         return False
     
-def get_oracle_connection_with_retry(max_retries=3, retry_delay=1):
-    """Get database connection with retry logic"""
-    for attempt in range(max_retries):
-        try:
-            return get_oracle_connection()
-        except oracledb.DatabaseError as e:
-            if attempt < max_retries - 1:
-                print(f"Connection attempt {attempt+1} failed: {e}. Retrying in {retry_delay}s...")
-                time.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff
-            else:
-                print(f"All {max_retries} connection attempts failed")
-                raise
-            
 def is_valid_content_url(url):
     """Check if URL is likely to contain text content"""
     # Skip common non-text content URLs and query params that indicate non-content
@@ -395,244 +439,869 @@ def contains_text_in_url(url):
             return True
             
     return False
+def user_has_active_job(user_id):
+    """
+    Check if a user has an active job with improved logging and validation
+    
+    Args:
+        user_id: The user ID to check
+        
+    Returns:
+        bool: True if the user has any active jobs, False otherwise
+    """
+    if not user_id:
+        print("Invalid user_id provided to user_has_active_job")
+        return False
+        
+    has_active = user_id in active_user_jobs and len(active_user_jobs[user_id]) > 0
+    
+    if has_active:
+        active_count = len(active_user_jobs[user_id])
+        active_jobs = ", ".join(list(active_user_jobs[user_id])[:3])  # Show first few jobs
+        print(f"User {user_id} has {active_count} active job(s): {active_jobs}...")
+    else:
+        print(f"User {user_id} has no active jobs")
+        
+    return has_active
 
-# Queue Management Functions
-def add_to_queue(user_id, source_url, additional_data=None):
-    """Add a URL to the processing queue for a user with optional additional data"""
-    connection = None
-    cursor = None
+def add_active_job(user_id, source_url):
+    """
+    Add a job to the active jobs list for a user with validation
+    
+    Args:
+        user_id: The user ID
+        source_url: The source URL for the job
+        
+    Returns:
+        bool: True if added successfully, False otherwise
+    """
+    if not user_id or not source_url:
+        print("Invalid parameters provided to add_active_job")
+        return False
+        
+    if user_id not in active_user_jobs:
+        active_user_jobs[user_id] = set()
+    
+    # Check if already in active jobs
+    if source_url in active_user_jobs[user_id]:
+        print(f"Job already active: {source_url} for user {user_id}")
+        return False
+        
+    active_user_jobs[user_id].add(source_url)
+    print(f"Added active job: {source_url} for user {user_id}")
+    
+    # Log total active jobs for this user
+    job_count = len(active_user_jobs[user_id])
+    print(f"User {user_id} now has {job_count} active job(s)")
+    
+    return True
+
+def remove_active_job(user_id, source_url):
+    """
+    Remove a job from the active jobs list for a user
+    
+    Args:
+        user_id: The user ID
+        source_url: The source URL for the job
+        
+    Returns:
+        bool: True if removed successfully, False otherwise
+    """
+    if not user_id or not source_url:
+        print("Invalid parameters provided to remove_active_job")
+        return False
+        
+    if user_id not in active_user_jobs:
+        print(f"User {user_id} has no active jobs to remove")
+        return False
+    
+    if source_url not in active_user_jobs[user_id]:
+        print(f"Job not found in active jobs: {source_url} for user {user_id}")
+        return False
+    
+    active_user_jobs[user_id].remove(source_url)
+    print(f"Removed active job: {source_url} for user {user_id}")
+    
+    # Clean up if no more active jobs
+    if len(active_user_jobs[user_id]) == 0:
+        del active_user_jobs[user_id]
+        print(f"User {user_id} now has no active jobs, removed from tracking")
+    else:
+        job_count = len(active_user_jobs[user_id])
+        print(f"User {user_id} now has {job_count} active job(s)")
+    
+    return True
+def auto_vectorize_data(user_id, source_url):
+    """
+    Automatically trigger vectorization for a completed URL
+    
+    Args:
+        user_id: The user ID
+        source_url: The source URL that has been processed
+        
+    Returns:
+        dict: Results of the vectorization process
+    """
     try:
-        connection = get_oracle_connection()
-        cursor = connection.cursor()
+        print(f"Auto-vectorizing data for URL: {source_url}, user: {user_id}")
         
-        # Check if it already exists in the queue
-        cursor.execute("""
-            SELECT COUNT(*) FROM {0}
-            WHERE USER_ID = :user_id AND SOURCE_URL = :source_url AND PROCESSED = 0
-        """.format(PROCESSING_QUEUE_TABLE), 
-           user_id=user_id, source_url=source_url)
+        # Import the vectorize function from oracle_chatbot.py
+        from oracle_chatbot import process_scrapped_text_to_vector_store, connect_to_jsondb
         
-        existing_count = cursor.fetchone()[0]
+        # Create a connection to the JSON database
+        jsondb_connection = connect_to_jsondb()
+        if not jsondb_connection:
+            print(f"Failed to connect to JSON database for vectorization")
+            return {
+                'status': 'error',
+                'message': 'Failed to connect to vector database',
+                'source_url': source_url
+            }
         
-        if existing_count > 0:
-            print(f"URL already in queue: {source_url} for user {user_id}")
+        try:
+            # Call the vectorization function with source_level_url filter
+            result = process_scrapped_text_to_vector_store(
+                jsondb_connection, 
+                user_id=user_id, 
+                source_level_url=source_url
+            )
+            
+            print(f"Vectorization completed for {source_url}: {result}")
+            return result
+        finally:
+            # Ensure connection is closed
+            if jsondb_connection:
+                jsondb_connection.close()
+    
+    except Exception as e:
+        print(f"Error during auto-vectorization for {source_url}: {str(e)}")
+        traceback.print_exc()
+        return {
+            'status': 'error',
+            'message': str(e),
+            'source_url': source_url
+        }
+def synchronize_active_jobs(user_id=None):
+    """
+    Synchronize in-memory active jobs tracking with database state
+    to ensure consistency in queue processing.
+    
+    Args:
+        user_id: Optional user ID to sync only for a specific user
+        
+    Returns:
+        dict: Statistics about the synchronization
+    """
+    try:
+        print(f"Synchronizing active jobs{' for user ' + str(user_id) if user_id else ''}")
+        
+        # Stats to return
+        stats = {
+            'added_to_memory': 0,
+            'removed_from_memory': 0,
+            'active_jobs_before': sum(len(jobs) for jobs in active_user_jobs.values()) if active_user_jobs else 0,
+            'active_jobs_after': 0
+        }
+        
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                # Build query based on parameters
+                query = """
+                    SELECT USER_ID, SOURCE_URL FROM {0}
+                    WHERE PROCESSED = 0 AND PROCESSING_STARTED IS NOT NULL
+                """.format(PROCESSING_QUEUE_TABLE)
+                
+                params = {}
+                
+                if user_id:
+                    query += " AND USER_ID = :user_id"
+                    params['user_id'] = user_id
+                    
+                # Get currently active jobs from database
+                cursor.execute(query, params)
+                active_from_db = {}
+                
+                for row in cursor.fetchall():
+                    db_user_id, db_source_url = row
+                    if db_user_id not in active_from_db:
+                        active_from_db[db_user_id] = set()
+                    active_from_db[db_user_id].add(db_source_url)
+                
+                # If filtering by user_id, only process that user
+                users_to_process = [user_id] if user_id else list(active_from_db.keys())
+                
+                # Add any missing users from in-memory tracking
+                if not user_id:
+                    users_to_process.extend([u for u in active_user_jobs.keys() if u not in users_to_process])
+                
+                # For each user, sync memory with database
+                for uid in users_to_process:
+                    if uid not in active_from_db:
+                        active_from_db[uid] = set()
+                    
+                    if uid not in active_user_jobs:
+                        active_user_jobs[uid] = set()
+                    
+                    # Items in DB but not in memory should be added to memory
+                    for url in active_from_db[uid]:
+                        if url not in active_user_jobs[uid]:
+                            active_user_jobs[uid].add(url)
+                            stats['added_to_memory'] += 1
+                            print(f"Added to memory tracking: {url} for user {uid}")
+                    
+                    # Items in memory but not in DB should be removed from memory
+                    urls_to_remove = []
+                    for url in active_user_jobs[uid]:
+                        if url not in active_from_db[uid]:
+                            urls_to_remove.append(url)
+                    
+                    for url in urls_to_remove:
+                        active_user_jobs[uid].remove(url)
+                        stats['removed_from_memory'] += 1
+                        print(f"Removed from memory tracking: {url} for user {uid}")
+                    
+                    # Clean up empty sets
+                    if not active_user_jobs[uid]:
+                        del active_user_jobs[uid]
+                        print(f"Removed empty tracking for user {uid}")
+        
+        # Calculate final stats
+        stats['active_jobs_after'] = sum(len(jobs) for jobs in active_user_jobs.values()) if active_user_jobs else 0
+        
+        print(f"Synchronization complete: {stats}")
+        return stats
+    
+    except Exception as e:
+        print(f"Error synchronizing active jobs: {str(e)}")
+        traceback.print_exc()
+        return {
+            'error': str(e),
+            'added_to_memory': 0,
+            'removed_from_memory': 0,
+            'active_jobs_before': 0,
+            'active_jobs_after': 0
+        }
+def recover_stalled_jobs(user_id=None, max_age_minutes=30):
+    """
+    Check for and recover stalled jobs in the queue
+    
+    Args:
+        user_id: Optional user ID to check only for a specific user
+        max_age_minutes: Maximum age in minutes for a job to be considered stalled
+        
+    Returns:
+        dict: Statistics about recovered jobs
+    """
+    try:
+        print(f"Checking for stalled jobs{' for user ' + str(user_id) if user_id else ''}")
+        
+        # Stats to return
+        stats = {
+            'stalled_jobs_found': 0,
+            'jobs_recovered': 0,
+            'jobs_failed': 0
+        }
+        
+        current_time = datetime.now()
+        cutoff_time = current_time - timedelta(minutes=max_age_minutes)
+        
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                # Build query to find stalled jobs
+                query = """
+                    SELECT ID, USER_ID, SOURCE_URL, PAGE_LIMIT,
+                           TO_CHAR(PROCESSING_STARTED, 'YYYY-MM-DD HH24:MI:SS') as START_TIME
+                    FROM {0}
+                    WHERE PROCESSED = 0 
+                    AND PROCESSING_STARTED IS NOT NULL
+                    AND PROCESSING_STARTED < :cutoff_time
+                """.format(PROCESSING_QUEUE_TABLE)
+                
+                params = {'cutoff_time': cutoff_time}
+                
+                if user_id:
+                    query += " AND USER_ID = :user_id"
+                    params['user_id'] = user_id
+                
+                # Get stalled jobs
+                cursor.execute(query, params)
+                stalled_jobs = cursor.fetchall()
+                
+                stats['stalled_jobs_found'] = len(stalled_jobs)
+                
+                if stalled_jobs:
+                    print(f"Found {len(stalled_jobs)} stalled jobs")
+                    
+                    # Process each stalled job
+                    for job in stalled_jobs:
+                        job_id, job_user_id, job_url, job_limit, job_start_time = job
+                        
+                        try:
+                            print(f"Recovering stalled job: {job_url} for user {job_user_id}, started at {job_start_time}")
+                            
+                            # Clean up any active job tracking
+                            if job_user_id in active_user_jobs and job_url in active_user_jobs[job_user_id]:
+                                active_user_jobs[job_user_id].remove(job_url)
+                                if not active_user_jobs[job_user_id]:
+                                    del active_user_jobs[job_user_id]
+                            
+                            # Clean up any events
+                            event_key = f"{job_user_id}:{job_url}"
+                            if event_key in crawling_events:
+                                crawling_events[event_key].set()
+                                del crawling_events[event_key]
+                            if event_key in processing_events:
+                                processing_events[event_key].set()
+                                del processing_events[event_key]
+                            
+                            # Reset the job to be picked up again
+                            cursor.execute("""
+                                UPDATE {0} SET PROCESSING_STARTED = NULL
+                                WHERE ID = :id
+                            """.format(PROCESSING_QUEUE_TABLE), id=job_id)
+                            
+                            connection.commit()
+                            stats['jobs_recovered'] += 1
+                            
+                            print(f"Successfully reset stalled job: {job_url}")
+                        except Exception as job_error:
+                            print(f"Error recovering job {job_id} ({job_url}): {str(job_error)}")
+                            stats['jobs_failed'] += 1
+                else:
+                    print("No stalled jobs found")
+        
+        # Synchronize active job tracking if we recovered any jobs
+        if stats['jobs_recovered'] > 0:
+            synchronize_active_jobs(user_id)
+        
+        print(f"Stalled job recovery complete: {stats}")
+        return stats
+        
+    except Exception as e:
+        print(f"Error recovering stalled jobs: {str(e)}")
+        traceback.print_exc()
+        return {
+            'error': str(e),
+            'stalled_jobs_found': 0,
+            'jobs_recovered': 0,
+            'jobs_failed': 0
+        }    
+# Queue Management Functions
+def perform_queue_maintenance():
+    """
+    Perform maintenance on the queue to ensure it's in a consistent state.
+    This function should be called at application startup.
+    
+    Returns:
+        dict: Statistics about maintenance operations
+    """
+    try:
+        print("Starting queue maintenance...")
+        
+        stats = {
+            'stalled_jobs': 0,
+            'memory_sync': {},
+            'next_jobs_started': 0
+        }
+        
+        # 1. Recover stalled jobs
+        stalled_results = recover_stalled_jobs(max_age_minutes=15)  # Consider jobs stalled after 15 minutes
+        stats['stalled_jobs'] = stalled_results
+        
+        # 2. Synchronize in-memory job tracking with database
+        sync_results = synchronize_active_jobs()
+        stats['memory_sync'] = sync_results
+        
+        # 3. For each user, check if they have no active jobs but queued jobs waiting
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                # Find users with queued jobs but no active processing
+                cursor.execute("""
+                    SELECT DISTINCT USER_ID FROM {0}
+                    WHERE PROCESSED = 0 AND PROCESSING_STARTED IS NULL
+                """.format(PROCESSING_QUEUE_TABLE))
+                
+                users_with_queued = [row[0] for row in cursor.fetchall()]
+                
+                for user_id in users_with_queued:
+                    # Check if this user has any active jobs
+                    if not user_has_active_job(user_id):
+                        # No active jobs, but has queued jobs - start the next one
+                        next_item = get_next_from_queue(user_id)
+                        
+                        if next_item:
+                            next_url = next_item['source_url']
+                            page_limit = next_item['page_limit']
+                            print(f"Starting next queued job for inactive user {user_id}: {next_url}")
+                            
+                            # Start processing
+                            result = start_crawling_and_processing(user_id, next_url, page_limit)
+                            
+                            if result:
+                                stats['next_jobs_started'] += 1
+                                print(f"Successfully started processing for queue item: {next_url}")
+        
+        print(f"Queue maintenance completed: {stats}")
+        return stats
+        
+    except Exception as e:
+        print(f"Error during queue maintenance: {str(e)}")
+        traceback.print_exc()
+        return {
+            'error': str(e),
+            'stalled_jobs': 0,
+            'memory_sync': {},
+            'next_jobs_started': 0
+        }
+
+# This function should be called when the application starts
+def initialize_queue_system():
+    """Initialize the queue system at application startup"""
+    try:
+        print("Initializing queue system...")
+        
+        # Reset in-memory tracking
+        global active_user_jobs, crawling_events, processing_events
+        active_user_jobs = {}
+        crawling_events = {}
+        processing_events = {}
+        
+        # Run maintenance to recover from any previous crashes
+        maintenance_results = perform_queue_maintenance()
+        
+        print(f"Queue system initialized: {maintenance_results}")
+        
+        # Optional: Set up a background thread to periodically check for stalled jobs
+        def maintenance_worker():
+            while True:
+                try:
+                    time.sleep(300)  # Run every 5 minutes
+                    print("Running scheduled queue maintenance...")
+                    perform_queue_maintenance()
+                except Exception as e:
+                    print(f"Error in maintenance worker: {str(e)}")
+        
+        maintenance_thread = Thread(target=maintenance_worker, daemon=True)
+        maintenance_thread.start()
+        
+        return True
+    except Exception as e:
+        print(f"Error initializing queue system: {str(e)}")
+        traceback.print_exc()
+        return False
+    
+def add_to_queue(user_id, source_url, additional_data=None):
+    """Add a URL to the processing queue for a user with better error handling and logging"""
+    try:
+        print(f"Adding URL to queue: {source_url} for user {user_id}")
+        
+        # Validate input
+        if not user_id or not source_url:
+            print("Invalid input: user_id and source_url are required")
             return False
             
-        # Set defaults
-        page_limit = 10
-        
-        # Update with any additional data
-        if additional_data:
-            if 'page_limit' in additional_data:
-                page_limit = additional_data['page_limit']
-        
-        # Insert queue item
-        cursor.execute("""
-            INSERT INTO {0} (USER_ID, SOURCE_URL, ADDED_AT, PROCESSED, PAGE_LIMIT)
-            VALUES (:user_id, :source_url, CURRENT_TIMESTAMP, 0, :page_limit)
-        """.format(PROCESSING_QUEUE_TABLE),
-           user_id=user_id, source_url=source_url, page_limit=page_limit)
-        
-        connection.commit()
-        print(f"Added URL to queue: {source_url} for user {user_id}, page_limit: {page_limit}")
-        return True
-    except oracledb.DatabaseError as e:
-        error, = e.args
-        print(f"Database error adding to queue: {str(error)}")
-        if error.code == 1: # Constraint violation code
-            print(f"URL already in queue (constraint error): {source_url}")
-            return False
-        traceback.print_exc()
-        if connection:
-            connection.rollback()
-        return False
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                # Check if it already exists in the queue
+                cursor.execute("""
+                    SELECT ID, PROCESSED, PROCESSING_STARTED FROM {0}
+                    WHERE USER_ID = :user_id AND SOURCE_URL = :source_url
+                """.format(PROCESSING_QUEUE_TABLE), 
+                   user_id=user_id, source_url=source_url)
+                
+                existing_row = cursor.fetchone()
+                
+                if existing_row:
+                    id, processed, started = existing_row
+                    
+                    if processed == 0:
+                        # Item already in queue and not processed
+                        if started:
+                            print(f"URL already in progress: {source_url} for user {user_id}")
+                        else:
+                            print(f"URL already in queue: {source_url} for user {user_id}")
+                        return False
+                    else:
+                        # Item was processed before, re-add it
+                        print(f"URL was previously processed, re-adding to queue: {source_url}")
+                        
+                        # Delete old entry
+                        cursor.execute("""
+                            DELETE FROM {0}
+                            WHERE ID = :id
+                        """.format(PROCESSING_QUEUE_TABLE), id=id)
+                        
+                        # Continue to add new entry
+                    
+                # Set defaults
+                page_limit = 10
+                
+                # Update with any additional data
+                if additional_data:
+                    if 'page_limit' in additional_data:
+                        page_limit = additional_data['page_limit']
+                
+                # Insert queue item with retry logic
+                retry_count = 0
+                max_retries = 3
+                
+                while retry_count < max_retries:
+                    try:
+                        cursor.execute("""
+                            INSERT INTO {0} (USER_ID, SOURCE_URL, ADDED_AT, PROCESSED, PAGE_LIMIT)
+                            VALUES (:user_id, :source_url, CURRENT_TIMESTAMP, 0, :page_limit)
+                        """.format(PROCESSING_QUEUE_TABLE),
+                           user_id=user_id, source_url=source_url, page_limit=page_limit)
+                        
+                        connection.commit()
+                        print(f"Added URL to queue: {source_url} for user {user_id}, page_limit: {page_limit}")
+                        return True
+                    except oracledb.DatabaseError as db_error:
+                        error, = db_error.args
+                        if error.code == 1:  # Constraint violation code
+                            print(f"URL already in queue (constraint error): {source_url}")
+                            return False
+                        else:
+                            # Other database error, retry
+                            print(f"Database error adding to queue (attempt {retry_count+1}): {str(error)}")
+                            retry_count += 1
+                            time.sleep(0.5)  # Short delay before retry
+                
+                # If we reach here, all retries failed
+                print(f"Failed to add URL to queue after {max_retries} attempts: {source_url}")
+                return False
     except Exception as e:
         print(f"Error adding to queue: {str(e)}")
         traceback.print_exc()
-        if connection:
-            connection.rollback()
         return False
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
 
-def get_next_from_queue(user_id):
-    """Get the next URL from the queue for a user"""
-    connection = None
-    cursor = None
+# Add these functions to your file_api.py file, preferably near the other helper functions
+
+def extract_domain(url):
+    """Helper function to extract domain from URL"""
     try:
-        connection = get_oracle_connection()
-        cursor = connection.cursor()
-        
-        # Find the oldest unprocessed URL for this user
-        cursor.execute("""
-            SELECT ID, SOURCE_URL, PAGE_LIMIT FROM {0}
-            WHERE USER_ID = :user_id AND PROCESSED = 0 AND PROCESSING_STARTED IS NULL
-            ORDER BY ADDED_AT ASC
-            FETCH FIRST 1 ROW ONLY
-        """.format(PROCESSING_QUEUE_TABLE), user_id=user_id)
-        
-        row = cursor.fetchone()
-        
-        if row:
-            queue_id, source_url, page_limit = row
-            
-            # Mark as processing started
-            cursor.execute("""
-                UPDATE {0} SET PROCESSING_STARTED = CURRENT_TIMESTAMP
-                WHERE ID = :id
-            """.format(PROCESSING_QUEUE_TABLE), id=queue_id)
-            
-            connection.commit()
-            
-            print(f"Retrieved next URL from queue: {source_url} for user {user_id}")
-            
-            # Return both the URL and the page limit
-            return {
-                'source_url': source_url,
-                'page_limit': page_limit or 10  # Default to 10 if None
-            }
-        else:
-            print(f"No more URLs in queue for user {user_id}")
-            return None
-    except Exception as e:
-        print(f"Error getting next from queue: {str(e)}")
-        traceback.print_exc()
-        if connection:
-            connection.rollback()
+        # Remove protocol and path
+        domain = re.sub(r'^https?://', '', url)
+        domain = re.sub(r'/.*$', '', domain)
+        return domain.lower()
+    except:
         return None
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
 
-def mark_as_complete_and_process_next(user_id, source_url):
-    """Mark a URL as complete in the queue and start processing the next one if available"""
+def continuous_crawl_job(top_level_source_url, stop_event, user_id=None, page_limit=10):
+    """
+    Worker function to continuously crawl all links from the starting URL
+    with improved batch processing, until all links are crawled or the page limit is reached.
+    """
     connection = None
     cursor = None
     try:
-        connection = get_oracle_connection()
-        cursor = connection.cursor()
+        print(f"Starting crawl job for {top_level_source_url} for user {user_id}")
         
-        # Mark the current URL as complete
-        cursor.execute("""
-            UPDATE {0} SET PROCESSED = 1, PROCESSING_COMPLETED = CURRENT_TIMESTAMP
-            WHERE USER_ID = :user_id AND SOURCE_URL = :source_url
-        """.format(PROCESSING_QUEUE_TABLE),
-           user_id=user_id, source_url=source_url)
+        # Extract the original domain for same-domain crawling
+        original_domain = extract_domain(top_level_source_url)
+        if not original_domain:
+            print(f"Invalid domain extracted from URL: {top_level_source_url}")
+            return {
+                'error': f"Invalid domain extracted from URL: {top_level_source_url}"
+            }
         
-        connection.commit()
-        print(f"Marked URL as complete: {source_url} for user {user_id}")
+        print(f"Original domain for same-domain crawling: {original_domain}")
+
+        # Stats counters
+        links_added = 0
+        errors_encountered = 0
         
-        # Update the active user jobs tracking
-        if user_id in active_user_jobs:
-            if source_url in active_user_jobs[user_id]:
-                active_user_jobs[user_id].remove(source_url)
-            if not active_user_jobs[user_id]:
-                del active_user_jobs[user_id]
-                
-        # Clean up event objects - IMPORTANT: Use the same key format as in start_crawling_and_processing
-        crawl_key = f"{user_id}:{source_url}"
-        process_key = f"{user_id}:{source_url}"
+        # Set to track consecutive empty runs (no new links added)
+        consecutive_empty_runs = 0
+        max_consecutive_empty_runs = 3  # After this many empty runs, terminate
         
-        # Only delete the events if they exist
-        if crawl_key in crawling_events:
-            crawling_events[crawl_key].set()  # Set the event first to signal threads to terminate
-            del crawling_events[crawl_key]
-            print(f"Cleaned up crawling event for {crawl_key}")
-            
-        if process_key in processing_events:
-            processing_events[process_key].set()  # Set the event first to signal threads to terminate
-            del processing_events[process_key]
-            print(f"Cleaned up processing event for {process_key}")
+        # Process URLs in small batches for better concurrency
+        BATCH_SIZE = 3
         
-        # Get the next URL from the queue
-        next_item = get_next_from_queue(user_id)
-        
-        if next_item:
-            next_url = next_item['source_url']
-            page_limit = next_item['page_limit']
-            print(f"Starting to process next URL: {next_url} with limit of {page_limit} pages for user {user_id}")
-            
-            # Ensure there are no lingering events for this URL before starting
-            next_crawl_key = f"{user_id}:{next_url}"
-            next_process_key = f"{user_id}:{next_url}"
-            
-            if next_crawl_key in crawling_events:
-                del crawling_events[next_crawl_key]
-            if next_process_key in processing_events:
-                del processing_events[next_process_key]
-            
-            # Start processing the next URL with its page limit
-            start_crawling_and_processing(user_id, next_url, page_limit)
-            return True
+        # Check if we have a limit
+        if page_limit == 0:
+            print("Page limit is set to 0 (unlimited)")
         else:
-            print(f"No more URLs in queue for user {user_id}")
-            return False
-    except Exception as e:
-        print(f"Error marking as complete and processing next: {str(e)}")
-        traceback.print_exc()
-        if connection:
-            connection.rollback()
-        return False
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
-
-def user_has_active_job(user_id):
-    """Check if a user has an active job"""
-    return user_id in active_user_jobs and len(active_user_jobs[user_id]) > 0
-
-def add_active_job(user_id, source_url):
-    """Add a job to the active jobs list for a user"""
-    if user_id not in active_user_jobs:
-        active_user_jobs[user_id] = set()
-    active_user_jobs[user_id].add(source_url)
-    print(f"Added active job: {source_url} for user {user_id}")
-
-def scrape_link(url):
-    """Scrape the content from a given URL"""
-    try:
-        # Add user agent to avoid being blocked
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            print(f"Page limit is set to {page_limit} crawled pages")
+        
+        while not stop_event.is_set():
+            try:
+                with get_db_connection() as connection:
+                    with connection.cursor() as cursor:
+                        # CRITICAL: Check how many URLs have already been crawled for this user and source
+                        cursor.execute("""
+                            SELECT COUNT(*) FROM {0}
+                            WHERE IS_CRAWLED = 1 AND TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
+                        """.format(LINKS_TO_SCRAP_TABLE), 
+                           source_url=top_level_source_url, user_id=user_id)
+                        
+                        already_crawled_count = cursor.fetchone()[0]
+                        
+                        # Check if we've reached the page limit
+                        if page_limit > 0 and already_crawled_count >= page_limit:
+                            print(f"REACHED PAGE LIMIT: {already_crawled_count}/{page_limit} pages crawled. Strictly enforcing limit.")
+                            break
+                            
+                        # Find out how many uncrawled links remain
+                        cursor.execute("""
+                            SELECT COUNT(*) FROM {0}
+                            WHERE (IS_CRAWLED = 0 OR IS_CRAWLED IS NULL) 
+                            AND TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
+                        """.format(LINKS_TO_SCRAP_TABLE), 
+                           source_url=top_level_source_url, user_id=user_id)
+                        
+                        links_remaining = cursor.fetchone()[0]
+                        
+                        # If no uncrawled links remain, we're done
+                        if links_remaining == 0:
+                            print(f"No more uncrawled links for {top_level_source_url} for user {user_id}. Exiting crawl job.")
+                            break
+                        
+                        # Calculate how many links we can process in this batch
+                        batch_limit = min(BATCH_SIZE, page_limit - already_crawled_count if page_limit > 0 else BATCH_SIZE)
+                        if batch_limit <= 0:
+                            break
+                            
+                        # Find the next uncrawled links (batch)
+                        cursor.execute("""
+                            SELECT ID, LINK, NVL(DEPTH, 0) AS DEPTH 
+                            FROM {0}
+                            WHERE (IS_CRAWLED = 0 OR IS_CRAWLED IS NULL)
+                            AND TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
+                            ORDER BY DEPTH ASC, ADDED_AT ASC
+                            FETCH FIRST :batch_limit ROWS ONLY
+                        """.format(LINKS_TO_SCRAP_TABLE), 
+                           source_url=top_level_source_url, user_id=user_id, batch_limit=batch_limit)
+                        
+                        link_rows = cursor.fetchall()
+                        
+                        if not link_rows:
+                            print(f"No more uncrawled links for {top_level_source_url} for user {user_id}. Exiting crawl job.")
+                            break
+                            
+                        # Mark all of these links as being crawled
+                        link_ids = [row[0] for row in link_rows]
+                        placeholders = ','.join([f':id{i}' for i in range(len(link_ids))])
+                        id_dict = {f'id{i}': id_val for i, id_val in enumerate(link_ids)}
+                        
+                        cursor.execute(f"""
+                            UPDATE {LINKS_TO_SCRAP_TABLE} 
+                            SET CRAWLING_STARTED = CURRENT_TIMESTAMP
+                            WHERE ID IN ({placeholders})
+                        """, **id_dict)
+                        
+                        connection.commit()
+                        
+                        batch_links_added = 0
+                        batch_errors = 0
+                        
+                        # Process each link in the batch
+                        for link_id, url_to_crawl, current_depth in link_rows:
+                            if stop_event.is_set():
+                                print(f"Stop event triggered during batch processing. Breaking out.")
+                                break
+                                
+                            try:
+                                # Add user agent to avoid being blocked
+                                headers = {
+                                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                                }
+                                
+                                # Make request to the URL with reduced timeout
+                                print(f"Making HTTP request to: {url_to_crawl}")
+                                response = requests.get(url_to_crawl, headers=headers, timeout=20)
+                                response.raise_for_status()
+                                
+                                # Parse the HTML content
+                                print(f"Parsing HTML content from: {url_to_crawl}")
+                                soup = BeautifulSoup(response.text, 'html.parser')
+                                
+                                # Find all anchor tags
+                                all_links = soup.find_all('a', href=True)
+                                
+                                # Base URL for resolving relative URLs
+                                base_url = url_to_crawl
+                                
+                                # Check if the HTML has a base tag
+                                base_tag = soup.find('base', href=True)
+                                if base_tag:
+                                    base_url = base_tag['href']
+                                
+                                # Extract URLs
+                                unique_links = []
+                                current_links_added = 0
+                                
+                                for link in all_links:
+                                    href = link['href'].strip()
+                                    
+                                    # Skip empty hrefs, javascript:, mailto:, tel: links
+                                    if not href or href.startswith(('javascript:', 'mailto:', 'tel:', '#')):
+                                        continue
+                                    
+                                    try:
+                                        # Convert relative URLs to absolute URLs
+                                        full_url = urljoin(base_url, href)
+                                        
+                                        # Check if the URL belongs to the same domain
+                                        link_domain = extract_domain(full_url)
+                                        if link_domain != original_domain:
+                                            continue
+                                        
+                                        # Skip invalid URLs, non-content URLs, and social media URLs
+                                        if not is_valid_url(full_url) or not is_valid_content_url(full_url) or is_social_media_url(full_url):
+                                            continue
+                                        
+                                        unique_links.append(full_url)
+                                    except Exception as link_error:
+                                        print(f"Error processing URL {href}: {str(link_error)}")
+                                        continue
+                                
+                                # Remove duplicates
+                                unique_links = list(set(unique_links))
+                                print(f"Found {len(unique_links)} valid URLs on {url_to_crawl}")
+                                
+                                # Batch insert links if we have any
+                                if unique_links:
+                                    # Use a more efficient approach for bulk insertion
+                                    values_list = []
+                                    for link in unique_links[:100]:  # Limit to 100 links per page to prevent overload
+                                        has_text = 1 if contains_text_in_url(link) else 0
+                                        values_list.append({
+                                            'link': link,
+                                            'top_level_source': top_level_source_url,
+                                            'user_id': user_id,
+                                            'source_url': url_to_crawl,
+                                            'depth': current_depth + 1,
+                                            'has_text': has_text
+                                        })
+                                    
+                                    # Use batch insert with MERGE to handle duplicates efficiently
+                                    batch_insert_result = batch_insert_links(connection, values_list)
+                                    if batch_insert_result > 0:
+                                        current_links_added += batch_insert_result
+                                        batch_links_added += batch_insert_result
+                                
+                                # Update the current link as crawled
+                                cursor.execute("""
+                                    UPDATE {0} SET
+                                        IS_CRAWLED = 1,
+                                        CRAWLED_AT = CURRENT_TIMESTAMP,
+                                        LINKS_FOUND = :links_found,
+                                        LINKS_ADDED = :links_added
+                                    WHERE ID = :id
+                                """.format(LINKS_TO_SCRAP_TABLE), 
+                                    id=link_id,
+                                    links_found=len(unique_links),
+                                    links_added=current_links_added
+                                )
+                                
+                                connection.commit()
+                                
+                            except requests.exceptions.RequestException as req_error:
+                                # Handle request-specific errors (network, timeout, etc.)
+                                print(f"Request error processing URL {url_to_crawl}: {str(req_error)}")
+                                
+                                # Update link as crawled with error
+                                cursor.execute("""
+                                    UPDATE {0} SET
+                                        IS_CRAWLED = 1,
+                                        CRAWLED_AT = CURRENT_TIMESTAMP,
+                                        ERROR = :error
+                                    WHERE ID = :id
+                                """.format(LINKS_TO_SCRAP_TABLE), 
+                                    id=link_id,
+                                    error=str(req_error)[:4000]  # Limit error message length
+                                )
+                                connection.commit()
+                                
+                                batch_errors += 1
+                                
+                            except Exception as e:
+                                # Catch any other unexpected errors
+                                print(f"Unexpected error processing URL {url_to_crawl}: {str(e)}")
+                                traceback.print_exc()
+                                
+                                # Update link as crawled with error
+                                cursor.execute("""
+                                    UPDATE {0} SET
+                                        IS_CRAWLED = 1,
+                                        CRAWLED_AT = CURRENT_TIMESTAMP,
+                                        ERROR = :error,
+                                        TRACEBACK = :traceback
+                                    WHERE ID = :id
+                                """.format(LINKS_TO_SCRAP_TABLE), 
+                                    id=link_id,
+                                    error=str(e)[:4000],
+                                    traceback=traceback.format_exc()[:4000]
+                                )
+                                connection.commit()
+                                
+                                batch_errors += 1
+                        
+                        # Update stats after batch
+                        links_added += batch_links_added
+                        errors_encountered += batch_errors
+                        
+                        # Update consecutive empty runs counter
+                        if batch_links_added > 0:
+                            consecutive_empty_runs = 0
+                        else:
+                            consecutive_empty_runs += 1
+                        
+                        # Check if we've had too many consecutive runs with no new links
+                        if consecutive_empty_runs >= max_consecutive_empty_runs:
+                            print(f"No new links found for {max_consecutive_empty_runs} consecutive runs. Exiting crawl job.")
+                            break
+                            
+                        # Check if we've now reached the limit after this batch
+                        if page_limit > 0 and already_crawled_count + len(link_rows) >= page_limit:
+                            print(f"REACHED PAGE LIMIT: {already_crawled_count + len(link_rows)}/{page_limit} pages crawled after batch. Exiting crawl job.")
+                            break
+                        
+                        # Brief pause between batches - much shorter than before
+                        time.sleep(0.1)
+                
+            except Exception as batch_error:
+                print(f"Error processing batch: {str(batch_error)}")
+                traceback.print_exc()
+                errors_encountered += 1
+                time.sleep(1)  # Brief delay on error before continuing
+        
+        # Final database connection to get final stats
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                # Get final count of crawled pages
+                cursor.execute("""
+                    SELECT COUNT(*) FROM {0}
+                    WHERE IS_CRAWLED = 1 AND TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
+                """.format(LINKS_TO_SCRAP_TABLE), 
+                   source_url=top_level_source_url, user_id=user_id)
+                
+                final_crawled_count = cursor.fetchone()[0]
+                
+                print(f"Crawl job completed: {final_crawled_count} pages crawled (of {page_limit} limit), {links_added} links added, {errors_encountered} errors")
+        
+        # Return stats if we exit the loop
+        return {
+            'links_crawled': final_crawled_count,
+            'links_added': links_added,
+            'errors_encountered': errors_encountered,
+            'page_limit': page_limit
         }
-        
-        # Make request to the URL
-        response = requests.get(url, headers=headers, timeout=30)
-        response.raise_for_status()  # Raise exception for 4XX/5XX responses
-        
-        # Parse the HTML content
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Extract all text content (removing script and style elements)
-        for script in soup(["script", "style"]):
-            script.extract()
             
-        # Get text and clean it
-        text = soup.get_text(separator=' ', strip=True)
-        
-        # Remove excessive whitespace
-        text = ' '.join(text.split())
-        
-        return {
-            'status': 'success',
-            'content': text
-        }
-    
     except Exception as e:
+        print(f"Error in continuous crawl job: {str(e)}")
+        traceback.print_exc()
         return {
-            'status': 'error',
-            'error': str(e)
+            'error': str(e),
+            'traceback': traceback.format_exc()
         }
 
 def start_crawling_and_processing(user_id, source_url, page_limit=10):
-    """Start the crawling and processing for a URL simultaneously with a processing delay"""
+    """
+    Start the crawling and processing for a URL simultaneously with a shorter processing delay
+    and improved concurrency using Thread objects
+    """
     # Add to active jobs list
     add_active_job(user_id, source_url)
     
@@ -670,9 +1339,6 @@ def start_crawling_and_processing(user_id, source_url, page_limit=10):
                 # If both are done, start the final cool-down
                 print(f"Both crawling and processing are done, starting final cooldown for {url}")
                 start_final_cooldown(user_id, url, completion_status)
-            else:
-                # Wait for processing to finish
-                print(f"Crawling finished, waiting for processing to complete for {url}")
         except Exception as e:
             print(f"Error in crawl thread: {e}")
             traceback.print_exc()
@@ -686,11 +1352,11 @@ def start_crawling_and_processing(user_id, source_url, page_limit=10):
                 print(f"Processing was already done, starting final cooldown for {url} despite crawling error")
                 start_final_cooldown(user_id, url, completion_status)
     
-    # Define a function for the processing thread
+    # Define a function for the processing thread with shorter delay
     def start_processing(url, stop_event, user_id, completion_status):
         try:
-            # Use 15 seconds delay
-            delay_seconds = 15
+            # Use 5 seconds delay (reduced from 15)
+            delay_seconds = 5
             print(f"Starting processing thread for {url}, user: {user_id} with {delay_seconds}s delay")
             result = continuous_processing_job(url, stop_event, delay_seconds, user_id)
             print(f"Processing completed with result: {result}")
@@ -720,11 +1386,8 @@ def start_crawling_and_processing(user_id, source_url, page_limit=10):
                 print(f"Crawling was already done, starting final cooldown for {url} despite processing error")
                 start_final_cooldown(user_id, url, completion_status)
     
-    # Function to start the final 40-second cool-down period
+    # Function to start the final cool-down period (shorter duration)
     def start_final_cooldown(user_id, url, completion_status):
-        connection = None
-        cursor = None
-        
         try:
             # Check if we're already in cooldown to prevent multiple cooldown processes
             if completion_status.get('in_final_cooldown', False):
@@ -734,106 +1397,101 @@ def start_crawling_and_processing(user_id, source_url, page_limit=10):
             print(f"Starting final cooldown for {url}, user: {user_id}")
             completion_status['in_final_cooldown'] = True
             
-            connection = get_oracle_connection()
-            cursor = connection.cursor()
-            
-            # Count total links before cooldown
-            cursor.execute("""
-                SELECT COUNT(*) FROM {0}
-                WHERE TOP_LEVEL_SOURCE = :url AND USER_ID = :user_id
-            """.format(LINKS_TO_SCRAP_TABLE), url=url, user_id=user_id)
-            
-            completion_status['links_before_cooldown'] = cursor.fetchone()[0]
-            
-            print(f"Starting final 40-second cool-down for {url}, user {user_id}")
-            print(f"Current link count before cool-down: {completion_status['links_before_cooldown']}")
-            
-            cooldown_duration = 40  # 40 seconds
-            cooldown_start_time = time.time()
-            
-            # Check for new links every 5 seconds during the cool-down period
-            while time.time() - cooldown_start_time < cooldown_duration:
-                # Skip if the stop events are set
-                if crawl_key in crawling_events and crawling_events[crawl_key].is_set():
-                    print(f"Crawling stop event is set during cooldown for {url}. Terminating cooldown.")
-                    break
+            with get_db_connection() as connection:
+                with connection.cursor() as cursor:
+                    # Count total links before cooldown
+                    cursor.execute("""
+                        SELECT COUNT(*) FROM {0}
+                        WHERE TOP_LEVEL_SOURCE = :url AND USER_ID = :user_id
+                    """.format(LINKS_TO_SCRAP_TABLE), 
+                       url=url, user_id=user_id)
                     
-                if process_key in processing_events and processing_events[process_key].is_set():
-                    print(f"Processing stop event is set during cooldown for {url}. Terminating cooldown.")
-                    break
-                
-                # Calculate remaining time
-                elapsed = time.time() - cooldown_start_time
-                remaining = cooldown_duration - elapsed
-                print(f"In final cool-down period. {remaining:.1f} seconds remaining. Checking for new links...")
-                
-                # Check if any new links have been discovered
-                cursor.execute("""
-                    SELECT COUNT(*) FROM {0}
-                    WHERE TOP_LEVEL_SOURCE = :url AND USER_ID = :user_id
-                """.format(LINKS_TO_SCRAP_TABLE), url=url, user_id=user_id)
-                
-                current_link_count = cursor.fetchone()[0]
-                
-                # Check if any links still need processing
-                cursor.execute("""
-                    SELECT COUNT(*) FROM {0}
-                    WHERE TOP_LEVEL_SOURCE = :url AND USER_ID = :user_id
-                    AND (IS_PROCESSED = 'false' OR IS_PROCESSED IS NULL)
-                """.format(LINKS_TO_SCRAP_TABLE), url=url, user_id=user_id)
-                
-                unprocessed_count = cursor.fetchone()[0]
-                
-                if current_link_count > completion_status['links_before_cooldown'] or unprocessed_count > 0:
-                    print(f"New links discovered during cool-down! Links before: {completion_status['links_before_cooldown']}, Current: {current_link_count}, Unprocessed: {unprocessed_count}")
-                    print(f"Restarting crawling and processing for {url}")
+                    completion_status['links_before_cooldown'] = cursor.fetchone()[0]
                     
-                    # Reset completion status
-                    completion_status['crawling_done'] = False
-                    completion_status['processing_done'] = False
-                    completion_status['in_final_cooldown'] = False
+                    # Reduced cooldown from 40 to 20 seconds for faster completion
+                    cooldown_duration = 20  # 20 seconds 
+                    cooldown_start_time = time.time()
                     
-                    # Start the crawling and processing again
-                    if unprocessed_count > 0 or current_link_count > completion_status['links_before_cooldown']:
-                        # Start the crawl thread again
-                        new_crawl_thread = Thread(
-                            target=start_crawl,
-                            args=(url, crawl_stop_event, user_id, page_limit, completion_status),
-                            daemon=True
-                        )
-                        new_crawl_thread.start()
+                    # Check for new links every 5 seconds during the cool-down period
+                    while time.time() - cooldown_start_time < cooldown_duration:
+                        # Skip if the stop events are set
+                        if crawl_key in crawling_events and crawling_events[crawl_key].is_set():
+                            print(f"Crawling stop event is set during cooldown for {url}. Terminating cooldown.")
+                            break
+                            
+                        if process_key in processing_events and processing_events[process_key].is_set():
+                            print(f"Processing stop event is set during cooldown for {url}. Terminating cooldown.")
+                            break
                         
-                        # Start the process thread again
-                        new_process_thread = Thread(
-                            target=start_processing,
-                            args=(url, process_stop_event, user_id, completion_status),
-                            daemon=True
-                        )
-                        new_process_thread.start()
+                        # Calculate remaining time
+                        elapsed = time.time() - cooldown_start_time
+                        remaining = cooldown_duration - elapsed
+                        print(f"In final cool-down period. {remaining:.1f} seconds remaining. Checking for new links...")
                         
-                        # Exit this cool-down function to let the new threads handle it
-                        return
-                
-                # Sleep for 5 seconds before checking again
-                time.sleep(5)
-            
-            # Cool-down period has elapsed with no new links
-            print(f"Final cool-down period of {cooldown_duration} seconds has elapsed. No new links found. Completing job for {url}")
-            
-            # Now mark as complete and process next in queue
-            mark_as_complete_and_process_next(user_id, url)
-            
+                        # Check if any new links have been discovered
+                        cursor.execute("""
+                            SELECT COUNT(*) FROM {0}
+                            WHERE TOP_LEVEL_SOURCE = :url AND USER_ID = :user_id
+                        """.format(LINKS_TO_SCRAP_TABLE), 
+                           url=url, user_id=user_id)
+                        
+                        current_link_count = cursor.fetchone()[0]
+                        
+                        # Check if any links still need processing
+                        cursor.execute("""
+                            SELECT COUNT(*) FROM {0}
+                            WHERE TOP_LEVEL_SOURCE = :url AND USER_ID = :user_id
+                            AND (IS_PROCESSED = 'false' OR IS_PROCESSED IS NULL)
+                        """.format(LINKS_TO_SCRAP_TABLE), 
+                           url=url, user_id=user_id)
+                        
+                        unprocessed_count = cursor.fetchone()[0]
+                        
+                        if current_link_count > completion_status['links_before_cooldown'] or unprocessed_count > 0:
+                            print(f"New links discovered during cool-down! Links before: {completion_status['links_before_cooldown']}, Current: {current_link_count}, Unprocessed: {unprocessed_count}")
+                            print(f"Restarting crawling and processing for {url}")
+                            
+                            # Reset completion status
+                            completion_status['crawling_done'] = False
+                            completion_status['processing_done'] = False
+                            completion_status['in_final_cooldown'] = False
+                            
+                            # Start the crawling and processing again
+                            if unprocessed_count > 0 or current_link_count > completion_status['links_before_cooldown']:
+                                # Start the crawl thread again
+                                new_crawl_thread = Thread(
+                                    target=start_crawl,
+                                    args=(url, crawl_stop_event, user_id, page_limit, completion_status),
+                                    daemon=True
+                                )
+                                new_crawl_thread.start()
+                                
+                                # Start the process thread again
+                                new_process_thread = Thread(
+                                    target=start_processing,
+                                    args=(url, process_stop_event, user_id, completion_status),
+                                    daemon=True
+                                )
+                                new_process_thread.start()
+                                
+                                # Exit this cool-down function to let the new threads handle it
+                                return
+                        
+                        # Sleep for 3 seconds before checking again (reduced from 5)
+                        time.sleep(3)
+                    
+                    # Cool-down period has elapsed with no new links
+                    print(f"Final cool-down period of {cooldown_duration} seconds has elapsed. No new links found. Completing job for {url}")
+                    
+                    # Now mark as complete and process next in queue
+                    mark_as_complete_and_process_next(user_id, url)
+                    
         except Exception as e:
             print(f"Error in final cool-down: {str(e)}")
             traceback.print_exc()
             
             # Even if there's an error, try to move to the next URL
             mark_as_complete_and_process_next(user_id, url)
-        finally:
-            if cursor:
-                cursor.close()
-            if connection:
-                connection.close()
     
     # Start the crawling in a background thread
     crawler_thread = Thread(
@@ -843,7 +1501,7 @@ def start_crawling_and_processing(user_id, source_url, page_limit=10):
     )
     crawler_thread.start()
     
-    # Start the processing in a background thread (with 15 second delay)
+    # Start the processing in a background thread (with shorter delay)
     processor_thread = Thread(
         target=start_processing,
         args=(source_url, process_stop_event, user_id, completion_status),
@@ -854,630 +1512,310 @@ def start_crawling_and_processing(user_id, source_url, page_limit=10):
     print(f"Started simultaneous crawling and processing for {source_url}, user {user_id}")
     return True
 
-def continuous_crawl_job(top_level_source_url, stop_event, user_id, page_limit=10):
+def batch_insert_links(connection, links_data):
     """
-    Worker function to continuously crawl pages until either:
-    1. All links are processed
-    2. stop_event is set
-    3. page_limit is reached (number of URLs marked as is_crawled: true)
+    Perform a batch insert of links using a more efficient approach
     
-    page_limit: Maximum number of pages to crawl (1-5000, 0 means no limit)
+    Args:
+        connection: Database connection
+        links_data: List of dictionaries with link data
+        
+    Returns:
+        Number of successfully inserted links
     """
-    connection = None
-    cursor = None
+    if not links_data:
+        return 0
+        
+    inserted_count = 0
+    
     try:
-        # Ensure page_limit is an integer and valid
-        try:
-            page_limit = int(page_limit)
-            if page_limit < 0:
-                page_limit = 0  # No limit
-            elif page_limit > 5000:
-                page_limit = 5000  # Max allowed
-        except (ValueError, TypeError):
-            page_limit = 10  # Default if invalid
-            
-        print(f"Starting continuous crawl job for {top_level_source_url} for user {user_id} with STRICT limit of {page_limit} crawled pages")
-        
-        # Add domain extraction function
-        def extract_domain(url):
-            try:
-                # Remove protocol and get domain
-                if '//' in url:
-                    domain = url.split('//', 1)[1].split('/', 1)[0]
-                else:
-                    domain = url.split('/', 1)[0]
-                return domain.lower()
-            except:
-                return url
-        
-        # Extract the domain from the top-level source URL to restrict crawling
-        original_domain = extract_domain(top_level_source_url)
-        print(f"Original domain to restrict crawling to: {original_domain}")
-        
-        # Stats counters
-        links_added = 0
-        errors_encountered = 0
-        
-        # Set to track consecutive empty runs (no new links added)
-        consecutive_empty_runs = 0
-        max_consecutive_empty_runs = 3  # After this many empty runs, terminate
-        
-        # Check if we have a limit
-        if page_limit == 0:
-            print("Page limit is set to 0 (unlimited)")
-        else:
-            print(f"Page limit is set to {page_limit} crawled pages")
-        
-        while not stop_event.is_set():
-            try:
-                connection = get_oracle_connection()
-                cursor = connection.cursor()
-                
-                # CRITICAL: Check how many URLs have already been crawled for this user and source
-                cursor.execute("""
-                    SELECT COUNT(*) FROM {0}
-                    WHERE IS_CRAWLED = 1 AND TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
-                """.format(LINKS_TO_SCRAP_TABLE), source_url=top_level_source_url, user_id=user_id)
-                
-                already_crawled_count = cursor.fetchone()[0]
-                
-                # Check if we've reached the page limit
-                if page_limit > 0 and already_crawled_count >= page_limit:
-                    print(f"REACHED PAGE LIMIT: {already_crawled_count}/{page_limit} pages crawled. Strictly enforcing limit.")
-                    break
-                    
-                # Find out how many uncrawled links remain
-                cursor.execute("""
-                    SELECT COUNT(*) FROM {0}
-                    WHERE (IS_CRAWLED = 0 OR IS_CRAWLED IS NULL) 
-                    AND TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
-                """.format(LINKS_TO_SCRAP_TABLE), source_url=top_level_source_url, user_id=user_id)
-                
-                links_remaining = cursor.fetchone()[0]
-                
-                # If no uncrawled links remain, we're done
-                if links_remaining == 0:
-                    print(f"No more uncrawled links for {top_level_source_url} for user {user_id}. Exiting crawl job.")
-                    break
-                
-                # Find the next uncrawled link
-                cursor.execute("""
-                    SELECT ID, LINK, NVL(DEPTH, 0) AS DEPTH 
-                    FROM {0}
-                    WHERE (IS_CRAWLED = 0 OR IS_CRAWLED IS NULL)
-                    AND TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
-                    ORDER BY DEPTH ASC, ADDED_AT ASC
-                    FETCH FIRST 1 ROW ONLY
-                """.format(LINKS_TO_SCRAP_TABLE), source_url=top_level_source_url, user_id=user_id)
-                
-                link_row = cursor.fetchone()
-                
-                if not link_row:
-                    print(f"No more uncrawled links for {top_level_source_url} for user {user_id}. Exiting crawl job.")
-                    break
-                    
-                link_id, url_to_crawl, current_depth = link_row
-                
-                # Mark the link as being crawled
-                cursor.execute("""
-                    UPDATE {0} SET CRAWLING_STARTED = CURRENT_TIMESTAMP
-                    WHERE ID = :id
-                """.format(LINKS_TO_SCRAP_TABLE), id=link_id)
-                
-                connection.commit()
-                
-                # Add user agent to avoid being blocked
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                }
-                
-                # Make request to the URL
-                print(f"Making HTTP request to: {url_to_crawl}")
-                response = requests.get(url_to_crawl, headers=headers, timeout=30)
-                response.raise_for_status()
-                
-                # Parse the HTML content
-                print(f"Parsing HTML content from: {url_to_crawl}")
-                soup = BeautifulSoup(response.text, 'html.parser')
-                
-                # Find all anchor tags
-                all_links = soup.find_all('a', href=True)
-                
-                # Base URL for resolving relative URLs
-                base_url = url_to_crawl
-                
-                # Check if the HTML has a base tag
-                base_tag = soup.find('base', href=True)
-                if base_tag:
-                    base_url = base_tag['href']
-                
-                # Extract URLs
-                unique_links = []
-                current_links_added = 0
-                
-                for link in all_links:
-                    href = link['href'].strip()
-                    
-                    # Skip empty hrefs, javascript:, mailto:, tel: links
-                    if not href or href.startswith(('javascript:', 'mailto:', 'tel:', '#')):
-                        continue
-                    
-                    try:
-                        # Convert relative URLs to absolute URLs
-                        full_url = urljoin(base_url, href)
-                        
-                        # Check if the URL belongs to the same domain
-                        link_domain = extract_domain(full_url)
-                        if link_domain != original_domain:
-                            continue
-                        
-                        # Skip invalid URLs, non-content URLs, and social media URLs
-                        if not is_valid_url(full_url) or not is_valid_content_url(full_url) or is_social_media_url(full_url):
-                            continue
-                        
-                        unique_links.append(full_url)
-                    except Exception as link_error:
-                        print(f"Error processing URL {href}: {str(link_error)}")
-                        continue
-                
-                # Remove duplicates
-                unique_links = list(set(unique_links))
-                print(f"Found {len(unique_links)} valid URLs on {url_to_crawl}")
-                
-                # Insert links with a MERGE statement to handle duplicates
-                for link in unique_links:
-                    try:
-                        # Use MERGE to handle unique constraint and update existing records
-                        cursor.execute("""
-                            MERGE INTO {0} t
-                            USING (
-                                SELECT 
-                                    :link AS LINK, 
-                                    :top_level_source AS TOP_LEVEL_SOURCE, 
-                                    :user_id AS USER_ID,
-                                    :source_url AS SOURCE_URL,
-                                    :depth AS DEPTH,
-                                    :has_text_in_url AS HAS_TEXT_IN_URL,
-                                    CURRENT_TIMESTAMP AS ADDED_AT
-                                FROM DUAL
-                            ) s
-                            ON (t.LINK = s.LINK AND t.USER_ID = s.USER_ID)
-                            WHEN NOT MATCHED THEN
-                                INSERT (
-                                    LINK, TOP_LEVEL_SOURCE, USER_ID, SOURCE_URL, 
-                                    DEPTH, HAS_TEXT_IN_URL, ADDED_AT, 
-                                    IS_CRAWLED, IS_PROCESSED
-                                ) VALUES (
-                                    s.LINK, s.TOP_LEVEL_SOURCE, s.USER_ID, s.SOURCE_URL,
-                                    s.DEPTH, s.HAS_TEXT_IN_URL, s.ADDED_AT,
-                                    0, 'false'
-                                )
-                            WHEN MATCHED THEN
-                                UPDATE SET 
-                                    TOP_LEVEL_SOURCE = s.TOP_LEVEL_SOURCE,
-                                    SOURCE_URL = s.SOURCE_URL,
-                                    DEPTH = LEAST(t.DEPTH, s.DEPTH)
-                        """.format(LINKS_TO_SCRAP_TABLE),
-                            link=link,
-                            top_level_source=top_level_source_url,
-                            user_id=user_id,
-                            source_url=url_to_crawl,
-                            depth=current_depth + 1,
-                            has_text_in_url=contains_text_in_url(link)
-                        )
-                        
-                        # If a new row was inserted, increment links_added
-                        if cursor.rowcount > 0:
-                            current_links_added += 1
-                        
-                    except oracledb.DatabaseError as db_error:
-                        error, = db_error.args
-                        print(f"Database error adding link {link}: {error}")
-                        # Log the error but continue processing
-                        if error.code != 1:  # Exclude unique constraint violations
-                            print(f"Non-unique constraint error: {error}")
-                
-                # Update the current link as crawled
-                cursor.execute("""
-                    UPDATE {0} SET
-                        IS_CRAWLED = 1,
-                        CRAWLED_AT = CURRENT_TIMESTAMP,
-                        LINKS_FOUND = :links_found,
-                        LINKS_ADDED = :links_added
-                    WHERE ID = :id
-                """.format(LINKS_TO_SCRAP_TABLE), 
-                    id=link_id,
-                    links_found=len(unique_links),
-                    links_added=current_links_added
-                )
-                
-                connection.commit()
-                
-                # Track links added
-                links_added += current_links_added
-                
-                # Update consecutive empty runs counter
-                if current_links_added > 0:
-                    consecutive_empty_runs = 0
-                else:
-                    consecutive_empty_runs += 1
-                
-                # Check if we've had too many consecutive runs with no new links
-                if consecutive_empty_runs >= max_consecutive_empty_runs:
-                    print(f"No new links found for {max_consecutive_empty_runs} consecutive runs. Exiting crawl job.")
-                    break
-                
-                # After processing, check if we've now reached the limit
-                if page_limit > 0 and already_crawled_count + 1 >= page_limit:
-                    print(f"REACHED PAGE LIMIT: {already_crawled_count + 1}/{page_limit} pages crawled. Exiting crawl job.")
-                    break
-                
-            except requests.exceptions.RequestException as req_error:
-                # Handle request-specific errors (network, timeout, etc.)
-                print(f"Request error processing URL {url_to_crawl}: {str(req_error)}")
-                
-                # Update link as crawled with error
-                try:
-                    cursor.execute("""
-                        UPDATE {0} SET
-                            IS_CRAWLED = 1,
-                            CRAWLED_AT = CURRENT_TIMESTAMP,
-                            ERROR = :error
-                        WHERE ID = :id
-                    """.format(LINKS_TO_SCRAP_TABLE), 
-                        id=link_id,
-                        error=str(req_error)[:4000]  # Limit error message length
-                    )
-                    connection.commit()
-                except Exception as update_error:
-                    print(f"Error updating link status: {str(update_error)}")
-                
-                errors_encountered += 1
-                consecutive_empty_runs += 1
-            
-            except Exception as e:
-                # Catch any other unexpected errors
-                print(f"Unexpected error processing URL {url_to_crawl}: {str(e)}")
-                traceback.print_exc()
-                
-                # Update link as crawled with error
-                try:
-                    cursor.execute("""
-                        UPDATE {0} SET
-                            IS_CRAWLED = 1,
-                            CRAWLED_AT = CURRENT_TIMESTAMP,
-                            ERROR = :error,
-                            TRACEBACK = :traceback
-                        WHERE ID = :id
-                    """.format(LINKS_TO_SCRAP_TABLE), 
-                        id=link_id,
-                        error=str(e)[:4000],
-                        traceback=traceback.format_exc()[:4000]
-                    )
-                    connection.commit()
-                except Exception as update_error:
-                    print(f"Error updating link status: {str(update_error)}")
-                
-                errors_encountered += 1
-                consecutive_empty_runs += 1
-            
-            finally:
-                # Close database connection after each iteration
-                if cursor:
-                    cursor.close()
-                    cursor = None
-                if connection:
-                    connection.close()
-                    connection = None
-                
-                # Optional: Sleep to prevent hammering the target server
-                time.sleep(0.5)
-        
-        # Final database connection to get final stats
-        connection = get_oracle_connection()
         cursor = connection.cursor()
         
-        # Get final count of crawled pages
-        cursor.execute("""
-            SELECT COUNT(*) FROM {0}
-            WHERE IS_CRAWLED = 1 AND TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
-        """.format(LINKS_TO_SCRAP_TABLE), source_url=top_level_source_url, user_id=user_id)
-        
-        final_crawled_count = cursor.fetchone()[0]
-        
-        print(f"Crawl job completed: {final_crawled_count} pages crawled (of {page_limit} limit), {links_added} links added, {errors_encountered} errors")
-        
-        # Return stats if we exit the loop
-        return {
-            'links_crawled': final_crawled_count,
-            'links_added': links_added,
-            'errors_encountered': errors_encountered,
-            'page_limit': page_limit
-        }
-            
-    except Exception as e:
-        print(f"Error in continuous crawl job: {str(e)}")
-        traceback.print_exc()
-        return {
-            'error': str(e),
-            'traceback': traceback.format_exc()
-        }
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
-
-def continuous_processing_job(top_level_source_url, stop_event, delay_seconds=60, user_id=None):
-    """
-    Worker function to continuously process all the scraped links
-    until all links in Links_to_scrap are processed (either successfully or failed).
-    Includes an initial delay before starting processing.
-    """
-    connection = None
-    cursor = None
-    try:
-        print(f"Starting processing job for {top_level_source_url} with {delay_seconds}s delay for user {user_id}")
-        
-        # Wait for the specified delay before starting processing
-        print(f"Waiting {delay_seconds} seconds before starting processing...")
-        
-        # Wait either for the delay or until the stop event is set
-        stop_event.wait(delay_seconds)
-        
-        # If stop event is set during the delay, exit early
-        if stop_event.is_set():
-            print(f"Processing job for {top_level_source_url} was stopped during delay")
-            return
-            
-        print(f"Delay complete, beginning processing for {top_level_source_url} for user {user_id}")
-        
-        # Stats counters
-        links_processed = 0
-        success_count = 0
-        error_count = 0
-        consecutive_empty_cycles = 0
-        max_consecutive_empty_cycles = 10  # Allow more empty cycles before exiting
-        
-        # Batch size for processing
-        batch_size = 20  # Smaller batch size for more frequent checking
-        
-        # Keep processing until explicitly stopped
-        while not stop_event.is_set():
+        # Oracle supports inserting multiple rows in a single statement
+        # But we'll need to handle potential constraint violations
+        for link_data in links_data:
             try:
-                # Create a new DB connection for each iteration to prevent connection timeouts
-                connection = get_oracle_connection()
-                cursor = connection.cursor()
-                # Find unprocessed links for this source URL
-                query = """
-                    SELECT ID, LINK, NVL(DEPTH, 0) AS DEPTH, TOP_LEVEL_SOURCE, SOURCE_URL, USER_ID
-                    FROM {0}
-                    WHERE (IS_PROCESSED = 'false' OR IS_PROCESSED IS NULL)
-                    AND TOP_LEVEL_SOURCE = :source_url
-                """.format(LINKS_TO_SCRAP_TABLE)
-                
-                # Add user_id filter if provided
-                params = {"source_url": top_level_source_url}
-                if user_id:
-                    query += " AND USER_ID = :user_id"
-                    params["user_id"] = user_id
-                
-                # Add row limit
-                query += " FETCH FIRST {0} ROWS ONLY".format(batch_size)
-                
-                print(f"Looking for unprocessed links with query: {query}")
-                
-                # First, check the count to avoid unnecessary cursor creation
-                count_query = """
-                    SELECT COUNT(*) FROM {0}
-                    WHERE (IS_PROCESSED = 'false' OR IS_PROCESSED IS NULL)
-                    AND TOP_LEVEL_SOURCE = :source_url
-                """.format(LINKS_TO_SCRAP_TABLE)
-                
-                if user_id:
-                    count_query += " AND USER_ID = :user_id"
-                
-                cursor.execute(count_query, params)
-                unprocessed_count = cursor.fetchone()[0]
-                print(f"Found {unprocessed_count} unprocessed links")
-                
-                if unprocessed_count == 0:
-                    # No unprocessed links found, wait and check again
-                    consecutive_empty_cycles += 1
-                    print(f"No unprocessed links found. Empty cycle #{consecutive_empty_cycles}/{max_consecutive_empty_cycles}")
-                    
-                    if consecutive_empty_cycles >= max_consecutive_empty_cycles:
-                        print(f"Reached maximum consecutive empty cycles ({max_consecutive_empty_cycles}). Exiting processing job.")
-                        break
-                    
-                    # Wait for a short time before checking again
-                    sleep_time = 5  # 5 seconds
-                    print(f"Waiting {sleep_time} seconds before checking for new links...")
-                    
-                    # Use stop_event.wait instead of time.sleep to respond to stop events
-                    if stop_event.wait(sleep_time):
-                        print("Stop event detected during wait. Exiting processing job.")
-                        break
-                    
-                    # Close this client before continuing the loop
-                    if cursor:
-                        cursor.close()
-                        cursor = None
-                    if connection:
-                        connection.close()
-                        connection = None
-                    
-                    continue
-                
-                # Reset the consecutive empty cycles counter since we found links
-                consecutive_empty_cycles = 0
-                
-                # Get a batch of unprocessed links
-                cursor.execute(query, params)
-                unprocessed_links = cursor.fetchall()
-                print(f"Processing batch of {len(unprocessed_links)} links")
-                
-                batch_processed = 0
-                
-                # Process each link in the batch
-                for link_row in unprocessed_links:
-                    if stop_event.is_set():
-                        print(f"Stop event triggered. Exiting processing job for {top_level_source_url}.")
-                        break
-                    
-                    try:
-                        link_id, link_url, depth, top_level, source, link_user_id = link_row
-                        print(f"Processing link: {link_url}")
-                        
-                        # Ensure link has user_id before processing
-                        effective_user_id = link_user_id or user_id
-                        
-                        if not effective_user_id:
-                            print(f"No user_id available for link: {link_url}, skipping")
-                            continue
-                            
-                        if not link_user_id and user_id:
-                            # Update the document in the database to include user_id
-                            cursor.execute("""
-                                UPDATE {0} SET USER_ID = :user_id
-                                WHERE ID = :id
-                            """.format(LINKS_TO_SCRAP_TABLE), id=link_id, user_id=user_id)
-                            
-                            connection.commit()
-                            print(f"Added missing user_id {user_id} to link document")
-                        
-                        # Create a link_doc dictionary to match the MongoDB interface
-                        link_doc = {
-                            'id': link_id,
-                            'link': link_url,
-                            'depth': depth,
-                            'top_level_source': top_level,
-                            'source_url': source,
-                            'user_id': effective_user_id
-                        }
-    
-                        # Process the link
-                        result = scrape_single_link(connection, link_doc, effective_user_id)
-                        
-                        if result['status'] == 'success':
-                            success_count += 1
-                            print(f"Successfully processed link: {link_url}")
-                        else:
-                            # Mark the link as failed instead of processed
-                            error_count += 1
-                            print(f"Failed to process link: {link_url}. Error: {result.get('error', 'Unknown error')}")
-                            
-                            # Update with failure status
-                            cursor.execute("""
-                                UPDATE {0} SET
-                                    IS_PROCESSED = 'Failed',
-                                    PROCESSED_AT = CURRENT_TIMESTAMP,
-                                    ERROR = :error,
-                                    TRACEBACK = :traceback,
-                                    USER_ID = :user_id
-                                WHERE ID = :id
-                            """.format(LINKS_TO_SCRAP_TABLE),
-                                id=link_id,
-                                error=result.get('error', 'Unknown error')[:4000],  # Limit for Oracle CLOB
-                                traceback=result.get('traceback', '')[:4000],      # Limit for Oracle CLOB
-                                user_id=effective_user_id
-                            )
-                            
-                            connection.commit()
-                        
-                        links_processed += 1
-                        batch_processed += 1
-                        
-                        # Log progress periodically
-                        if links_processed % 10 == 0:
-                            print(f"Processed {links_processed} links for {top_level_source_url} ({success_count} successful, {error_count} failed) for user {effective_user_id}")
-                        
-                    except Exception as e:
-                        # Catch any unexpected errors during processing
-                        error_msg = f"Unexpected error processing link {link_url}: {str(e)}"
-                        print(error_msg)
-                        tb = traceback.format_exc()
-                        traceback.print_exc()
-                        
-                        # Mark the link as failed
-                        cursor.execute("""
-                            UPDATE {0} SET
-                                IS_PROCESSED = 'Failed',
-                                PROCESSED_AT = CURRENT_TIMESTAMP,
-                                ERROR = :error,
-                                TRACEBACK = :traceback,
-                                USER_ID = :user_id
-                            WHERE ID = :id
-                        """.format(LINKS_TO_SCRAP_TABLE),
-                            id=link_id,
-                            error=error_msg[:4000],  # Limit for Oracle CLOB
-                            traceback=tb[:4000],     # Limit for Oracle CLOB
-                            user_id=effective_user_id
+                # Use MERGE to handle unique constraint with a single statement
+                cursor.execute(f"""
+                    MERGE INTO {LINKS_TO_SCRAP_TABLE} t
+                    USING (
+                        SELECT 
+                            :link AS LINK, 
+                            :top_level_source AS TOP_LEVEL_SOURCE, 
+                            :user_id AS USER_ID,
+                            :source_url AS SOURCE_URL,
+                            :depth AS DEPTH,
+                            :has_text AS HAS_TEXT_IN_URL
+                        FROM DUAL
+                    ) s
+                    ON (t.LINK = s.LINK AND t.USER_ID = s.USER_ID)
+                    WHEN NOT MATCHED THEN
+                        INSERT (
+                            LINK, TOP_LEVEL_SOURCE, USER_ID, SOURCE_URL, 
+                            DEPTH, HAS_TEXT_IN_URL, ADDED_AT, 
+                            IS_CRAWLED, IS_PROCESSED
+                        ) VALUES (
+                            s.LINK, s.TOP_LEVEL_SOURCE, s.USER_ID, s.SOURCE_URL,
+                            s.DEPTH, s.HAS_TEXT_IN_URL, CURRENT_TIMESTAMP,
+                            0, 'false'
                         )
-                        
-                        connection.commit()
-                        error_count += 1
+                    WHEN MATCHED THEN
+                        UPDATE SET 
+                            DEPTH = LEAST(t.DEPTH, s.DEPTH)
+                            WHERE s.DEPTH < t.DEPTH
+                """,
+                    link=link_data['link'],
+                    top_level_source=link_data['top_level_source'],
+                    user_id=link_data['user_id'],
+                    source_url=link_data['source_url'],
+                    depth=link_data['depth'],
+                    has_text=link_data['has_text']
+                )
+                
+                # Only count as an insert if a row was affected
+                if cursor.rowcount > 0:
+                    inserted_count += 1
                     
-                    # Short sleep between links to prevent hammering the server
-                    time.sleep(0.5)
+            except oracledb.DatabaseError as db_error:
+                # Log but continue with other links
+                error, = db_error.args
+                print(f"Database error on MERGE for link {link_data['link']}: {error}")
+                continue
                 
-                print(f"Batch complete. Processed {batch_processed} links.")
-                
-                # Clean up DB connection after batch processing
-                if cursor:
-                    cursor.close()
-                    cursor = None
-                if connection:
-                    connection.close()
-                    connection = None
-                
-                # If the batch was smaller than the batch size, take a short break before checking again
-                if batch_processed < batch_size:
-                    sleep_time = 3  # 3 seconds
-                    print(f"Processed less than batch size. Waiting {sleep_time} seconds before continuing...")
-                    if stop_event.wait(sleep_time):
-                        print("Stop event detected during wait. Exiting processing job.")
-                        break
-                
-            except Exception as batch_error:
-                print(f"Error processing batch: {str(batch_error)}")
-                traceback.print_exc()
-                
-                # Sleep before retrying
-                time.sleep(5)
-                
-                # Close client in case of error
-                if cursor:
-                    cursor.close()
-                    cursor = None
-                if connection:
-                    connection.close()
-                    connection = None
+        connection.commit()
+        return inserted_count
         
-        print(f"Processing job completed or stopped: {links_processed} links processed, {success_count} successful, {error_count} failed")
-        
-        # Return stats if we exit the loop
-        return {
-            'links_processed': links_processed,
-            'success_count': success_count,
-            'error_count': error_count
-        }
-            
     except Exception as e:
-        print(f"Error in continuous processing job: {str(e)}")
+        print(f"Error in batch_insert_links: {e}")
         traceback.print_exc()
-        return {
-            'error': str(e),
-            'traceback': traceback.format_exc()
-        }
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
+        connection.rollback()
+        return inserted_count
+    
+def mark_as_complete_and_process_next(user_id, source_url):
+    """Mark a URL as complete in the queue, trigger vectorization, and start processing the next one if available"""
+    try:
+        print(f"Marking URL as complete and checking for next URL: {source_url} for user {user_id}")
+        
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                # Mark the current URL as complete
+                cursor.execute("""
+                    UPDATE {0} SET PROCESSED = 1, PROCESSING_COMPLETED = CURRENT_TIMESTAMP
+                    WHERE USER_ID = :user_id AND SOURCE_URL = :source_url
+                """.format(PROCESSING_QUEUE_TABLE),
+                   user_id=user_id, source_url=source_url)
+                
+                rows_updated = cursor.rowcount
+                connection.commit()
+                
+                print(f"Marked URL as complete: {source_url} for user {user_id}, rows affected: {rows_updated}")
+                
+                # Update the active user jobs tracking
+                if user_id in active_user_jobs:
+                    if source_url in active_user_jobs[user_id]:
+                        active_user_jobs[user_id].remove(source_url)
+                        print(f"Removed {source_url} from active jobs for user {user_id}")
+                    if not active_user_jobs[user_id]:
+                        del active_user_jobs[user_id]
+                        print(f"No more active jobs for user {user_id}, removed from tracking")
+                
+                # Clean up event objects
+                crawl_key = f"{user_id}:{source_url}"
+                process_key = f"{user_id}:{source_url}"
+                
+                # Only delete the events if they exist
+                if crawl_key in crawling_events:
+                    crawling_events[crawl_key].set()  # Set the event first to signal threads to terminate
+                    del crawling_events[crawl_key]
+                    print(f"Cleaned up crawling event for {crawl_key}")
+                    
+                if process_key in processing_events:
+                    processing_events[process_key].set()  # Set the event first to signal threads to terminate
+                    del processing_events[process_key]
+                    print(f"Cleaned up processing event for {process_key}")
+                
+                # Count scrapped documents
+                cursor.execute("""
+                    SELECT COUNT(*) FROM {0}
+                    WHERE TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
+                """.format(SCRAPPED_TEXT_TABLE), 
+                   source_url=source_url, user_id=user_id)
+                
+                scrapped_count = cursor.fetchone()[0]
+                
+                if scrapped_count > 0:
+                    print(f"Found {scrapped_count} scrapped documents for {source_url}, triggering vectorization")
+                    
+                    # Start vectorization in a background thread to avoid blocking
+                    def vectorize_thread():
+                        try:
+                            vectorize_result = auto_vectorize_data(user_id, source_url)
+                            print(f"Background vectorization completed for {source_url}: {vectorize_result}")
+                        except Exception as e:
+                            print(f"Error in vectorization thread: {str(e)}")
+                            traceback.print_exc()
+                    
+                    vectorization_thread = Thread(target=vectorize_thread, daemon=True)
+                    vectorization_thread.start()
+                    print(f"Started background vectorization for {source_url}")
+                else:
+                    print(f"No scrapped documents found for {source_url}, skipping vectorization")
+                
+                # Get the next URL from the queue - needs to happen after cleanup
+                next_item = get_next_from_queue(user_id)
+                
+                if next_item:
+                    next_url = next_item['source_url']
+                    page_limit = next_item['page_limit']
+                    print(f"Starting to process next URL: {next_url} with limit of {page_limit} pages for user {user_id}")
+                    
+                    # Ensure there are no lingering events for this URL before starting
+                    next_crawl_key = f"{user_id}:{next_url}"
+                    next_process_key = f"{user_id}:{next_url}"
+                    
+                    if next_crawl_key in crawling_events:
+                        del crawling_events[next_crawl_key]
+                    if next_process_key in processing_events:
+                        del processing_events[next_process_key]
+                    
+                    # Start processing the next URL with its page limit
+                    start_crawling_and_processing(user_id, next_url, page_limit)
+                    return True
+                else:
+                    print(f"No more URLs in queue for user {user_id}")
+                    return False
+    except Exception as e:
+        print(f"Error marking as complete and processing next: {str(e)}")
+        traceback.print_exc()
+        return False
+
+def get_next_from_queue(user_id):
+    """Get the next URL from the queue for a user with improved error handling"""
+    try:
+        print(f"Getting next URL from queue for user: {user_id}")
+        
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                # Find the oldest unprocessed URL for this user
+                cursor.execute("""
+                    SELECT ID, SOURCE_URL, PAGE_LIMIT FROM {0}
+                    WHERE USER_ID = :user_id AND PROCESSED = 0 AND PROCESSING_STARTED IS NULL
+                    ORDER BY ADDED_AT ASC
+                    FETCH FIRST 1 ROW ONLY
+                """.format(PROCESSING_QUEUE_TABLE), 
+                   user_id=user_id)
+                
+                row = cursor.fetchone()
+                
+                if row:
+                    queue_id, source_url, page_limit = row
+                    
+                    # Mark as processing started with retry logic
+                    retry_count = 0
+                    max_retries = 3
+                    
+                    while retry_count < max_retries:
+                        try:
+                            cursor.execute("""
+                                UPDATE {0} SET PROCESSING_STARTED = CURRENT_TIMESTAMP
+                                WHERE ID = :id AND PROCESSING_STARTED IS NULL
+                            """.format(PROCESSING_QUEUE_TABLE), 
+                               id=queue_id)
+                            
+                            rows_affected = cursor.rowcount
+                            connection.commit()
+                            
+                            if rows_affected > 0:
+                                print(f"Successfully marked queue item {queue_id} as started for URL: {source_url}")
+                                break
+                            else:
+                                # Item may have been picked up by another process
+                                print(f"Queue item {queue_id} was already being processed by another worker")
+                                retry_count += 1
+                        except Exception as update_error:
+                            print(f"Error updating queue item (attempt {retry_count+1}): {str(update_error)}")
+                            retry_count += 1
+                            time.sleep(0.5)  # Short delay before retry
+                    
+                    # Verify queue item is still available after update
+                    cursor.execute("""
+                        SELECT ID FROM {0}
+                        WHERE ID = :id AND PROCESSING_STARTED IS NOT NULL AND PROCESSED = 0
+                    """.format(PROCESSING_QUEUE_TABLE), 
+                       id=queue_id)
+                    
+                    verify_row = cursor.fetchone()
+                    
+                    if verify_row:
+                        print(f"Retrieved next URL from queue: {source_url} for user {user_id}")
+                        
+                        # Return both the URL and the page limit
+                        return {
+                            'source_url': source_url,
+                            'page_limit': page_limit or 10  # Default to 10 if None
+                        }
+                    else:
+                        print(f"Queue item {queue_id} could not be reserved, retrying with another item")
+                        # Recursive call to get the next item
+                        return get_next_from_queue(user_id)
+                else:
+                    print(f"No more URLs in queue for user {user_id}")
+                    return None
+    except Exception as e:
+        print(f"Error getting next from queue: {str(e)}")
+        traceback.print_exc()
+        return None
+def add_word_count_field():
+    """
+    Add a WORD_COUNT column to the SCRAPPED_TEXT table if it doesn't exist.
+    This is a safe operation that can be run even if the column already exists.
+    """
+    try:
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                # Check if the column already exists
+                cursor.execute("""
+                    SELECT COUNT(*) FROM USER_TAB_COLUMNS 
+                    WHERE TABLE_NAME = 'SCRAPPED_TEXT' AND COLUMN_NAME = 'WORD_COUNT'
+                """)
+                
+                column_exists = cursor.fetchone()[0] > 0
+                
+                if not column_exists:
+                    # Add the column
+                    cursor.execute("""
+                        ALTER TABLE SCRAPPED_TEXT 
+                        ADD WORD_COUNT NUMBER DEFAULT 0
+                    """)
+                    
+                    connection.commit()
+                    print("Added WORD_COUNT column to SCRAPPED_TEXT table")
+                else:
+                    print("WORD_COUNT column already exists in SCRAPPED_TEXT table")
+                    
+                return not column_exists  # Return True if added, False if already existed
+                
+    except Exception as e:
+        print(f"Error adding word count field: {str(e)}")
+        traceback.print_exc()
+        return False    
+
+def calculate_word_count(text):
+    """
+    Calculate the number of words in a text.
+    
+    Args:
+        text: The text to count words in
+        
+    Returns:
+        int: Number of words
+    """
+    # Remove excessive whitespace and split by whitespace
+    words = text.strip().split()
+    return len(words)
 
 def scrape_single_link(connection, link_doc, user_id=None):
-    """Helper function to scrape a single link"""
+    """Helper function to scrape a single link with word count tracking"""
     link = link_doc['link']
     print(f"Starting to scrape link: {link} for user: {user_id}")
     
@@ -1530,15 +1868,15 @@ def scrape_single_link(connection, link_doc, user_id=None):
         except requests.exceptions.RequestException as req_error:
             print(f"Request error: {str(req_error)}")
             # Update the link record to mark it as processed with error
-            cursor.execute("""
-                UPDATE {0} SET
+            cursor.execute(f"""
+                UPDATE {LINKS_TO_SCRAP_TABLE} SET
                     IS_PROCESSED = 'Failed',
                     PROCESSED_AT = CURRENT_TIMESTAMP,
                     ERROR = :error,
                     USER_ID = :user_id,
                     TOP_LEVEL_SOURCE = :top_level_source
                 WHERE ID = :id
-            """.format(LINKS_TO_SCRAP_TABLE),
+            """,
                 id=link_doc['id'],
                 error=f"Request error: {str(req_error)}"[:4000],  # Limit for Oracle CLOB
                 user_id=link_doc_user_id,
@@ -1601,24 +1939,38 @@ def scrape_single_link(connection, link_doc, user_id=None):
         
         # Remove excessive whitespace
         text = re.sub(r'\n\s*\n', '\n\n', text)
-        print(f"Extracted text length: {len(text)} characters")
+        
+        # Calculate word count
+        word_count = calculate_word_count(text)
+        
+        print(f"Extracted text length: {len(text)} characters, {word_count} words")
         
         # Check if content already exists to avoid duplicates
-        cursor.execute("""
-            SELECT COUNT(*) FROM {0}
+        cursor.execute(f"""
+            SELECT COUNT(*) FROM {SCRAPPED_TEXT_TABLE}
             WHERE CONTENT_LINK = :link AND USER_ID = :user_id
-        """.format(SCRAPPED_TEXT_TABLE), link=link, user_id=link_doc_user_id)
+        """, link=link, user_id=link_doc_user_id)
         
         if cursor.fetchone()[0] > 0:
             print(f"Content already exists for {link}, skipping insertion")
             
             # Get the content ID
-            cursor.execute("""
-                SELECT ID FROM {0}
+            cursor.execute(f"""
+                SELECT ID FROM {SCRAPPED_TEXT_TABLE}
                 WHERE CONTENT_LINK = :link AND USER_ID = :user_id
-            """.format(SCRAPPED_TEXT_TABLE), link=link, user_id=link_doc_user_id)
+            """, link=link, user_id=link_doc_user_id)
             
             content_id = cursor.fetchone()[0]
+            
+            # Update the word count
+            cursor.execute(f"""
+                UPDATE {SCRAPPED_TEXT_TABLE} 
+                SET WORD_COUNT = :word_count
+                WHERE ID = :id
+            """, word_count=word_count, id=content_id)
+            
+            connection.commit()
+            print(f"Updated word count ({word_count}) for existing content ID: {content_id}")
         else:
             # Insert into content collection
             print(f"Inserting content into database for {link}")
@@ -1626,15 +1978,15 @@ def scrape_single_link(connection, link_doc, user_id=None):
                 # Create a variable to hold the returned ID
                 content_id_var = cursor.var(int)
                 
-                cursor.execute("""
-                    INSERT INTO {0} (
+                cursor.execute(f"""
+                    INSERT INTO {SCRAPPED_TEXT_TABLE} (
                         SCRAPPED_CONTENT, CONTENT_LINK, SCRAPE_DATE, LINK_ID,
-                        SOURCE_URL, TOP_LEVEL_SOURCE, DEPTH, TITLE, USER_ID
+                        SOURCE_URL, TOP_LEVEL_SOURCE, DEPTH, TITLE, USER_ID, WORD_COUNT
                     ) VALUES (
                         :content, :link, CURRENT_TIMESTAMP, :link_id,
-                        :source_url, :top_level_source, :depth, :title, :user_id
+                        :source_url, :top_level_source, :depth, :title, :user_id, :word_count
                     ) RETURNING ID INTO :content_id
-                """.format(SCRAPPED_TEXT_TABLE),
+                """,
                     content=text,
                     link=link,
                     link_id=link_doc['id'],
@@ -1643,12 +1995,13 @@ def scrape_single_link(connection, link_doc, user_id=None):
                     depth=link_doc.get('depth', 0),
                     title=title_text[:1000],  # Limit to column size
                     user_id=link_doc_user_id,
+                    word_count=word_count,
                     content_id=content_id_var
                 )
 
-                content_id = content_id_var.getvalue()
+                content_id = content_id_var.getvalue()[0]
                 connection.commit()
-                print(f"Content inserted with ID: {content_id}")
+                print(f"Content inserted with ID: {content_id}, word count: {word_count}")
                 
             except oracledb.DatabaseError as db_error:
                 error, = db_error.args
@@ -1659,14 +2012,14 @@ def scrape_single_link(connection, link_doc, user_id=None):
         # Update the link as processed
         print(f"Updating link status to processed for {link}")
         try:
-            cursor.execute("""
-                UPDATE {0} SET
+            cursor.execute(f"""
+                UPDATE {LINKS_TO_SCRAP_TABLE} SET
                     IS_PROCESSED = 'true',
                     PROCESSED_AT = CURRENT_TIMESTAMP,
                     TOP_LEVEL_SOURCE = :top_level_source,
                     USER_ID = :user_id
                 WHERE ID = :id
-            """.format(LINKS_TO_SCRAP_TABLE),
+            """,
                 id=link_doc['id'],
                 top_level_source=top_level_source,
                 user_id=link_doc_user_id
@@ -1685,6 +2038,7 @@ def scrape_single_link(connection, link_doc, user_id=None):
             'status': 'success',
             'link': link,
             'content_length': len(text),
+            'word_count': word_count,
             'title': title_text,
             'content_id': str(content_id),
             'top_level_source': top_level_source,
@@ -1699,15 +2053,15 @@ def scrape_single_link(connection, link_doc, user_id=None):
         # Update the link as failed
         try:
             if cursor:
-                cursor.execute("""
-                    UPDATE {0} SET
+                cursor.execute(f"""
+                    UPDATE {LINKS_TO_SCRAP_TABLE} SET
                         IS_PROCESSED = 'Failed',
                         PROCESSED_AT = CURRENT_TIMESTAMP,
                         ERROR = :error,
                         USER_ID = :user_id,
                         TOP_LEVEL_SOURCE = :top_level_source
                     WHERE ID = :id
-                """.format(LINKS_TO_SCRAP_TABLE),
+                """,
                     id=link_doc['id'],
                     error=error_msg[:4000],  # Limit for Oracle CLOB
                     user_id=link_doc_user_id,
@@ -1733,8 +2087,8 @@ def scrape_single_link(connection, link_doc, user_id=None):
         # Update the link as failed
         try:
             if cursor:
-                cursor.execute("""
-                    UPDATE {0} SET
+                cursor.execute(f"""
+                    UPDATE {LINKS_TO_SCRAP_TABLE} SET
                         IS_PROCESSED = 'Failed',
                         PROCESSED_AT = CURRENT_TIMESTAMP,
                         ERROR = :error,
@@ -1742,7 +2096,7 @@ def scrape_single_link(connection, link_doc, user_id=None):
                         USER_ID = :user_id,
                         TOP_LEVEL_SOURCE = :top_level_source
                     WHERE ID = :id
-                """.format(LINKS_TO_SCRAP_TABLE),
+                """,
                     id=link_doc['id'],
                     error=error_msg[:4000],  # Limit for Oracle CLOB
                     traceback=tb[:4000],     # Limit for Oracle CLOB
@@ -1764,11 +2118,229 @@ def scrape_single_link(connection, link_doc, user_id=None):
         if cursor:
             cursor.close()
 
+def continuous_processing_job(top_level_source_url, stop_event, delay_seconds=5, user_id=None):
+    """
+    Worker function to continuously process all the scraped links
+    with improved batch processing and reduced delays.
+    
+    Args:
+        top_level_source_url: The top-level source URL
+        stop_event: Event to signal stopping the process
+        delay_seconds: Initial delay before starting processing (reduced from 60 to 5)
+        user_id: Optional user ID
+    """
+    try:
+        print(f"Starting processing job for {top_level_source_url} with {delay_seconds}s delay for user {user_id}")
+        
+        # Wait for the specified delay before starting processing
+        print(f"Waiting {delay_seconds} seconds before starting processing...")
+        
+        # Wait either for the delay or until the stop event is set
+        if stop_event.wait(delay_seconds):
+            print(f"Processing job for {top_level_source_url} was stopped during delay")
+            return
+            
+        print(f"Delay complete, beginning processing for {top_level_source_url} for user {user_id}")
+        
+        # Stats counters
+        links_processed = 0
+        success_count = 0
+        error_count = 0
+        consecutive_empty_cycles = 0
+        max_consecutive_empty_cycles = 5  # Allow more empty cycles before exiting
+        
+        # Batch size for processing - process more links at once
+        batch_size = 10  # Process more links per batch for better efficiency
+        
+        # Keep processing until explicitly stopped
+        while not stop_event.is_set():
+            try:
+                # Create a new DB connection for each iteration to prevent connection timeouts
+                with get_db_connection() as connection:
+                    with connection.cursor() as cursor:
+                        # Find unprocessed links for this source URL
+                        query = """
+                            SELECT ID, LINK, NVL(DEPTH, 0) AS DEPTH, TOP_LEVEL_SOURCE, SOURCE_URL, USER_ID
+                            FROM {0}
+                            WHERE (IS_PROCESSED = 'false' OR IS_PROCESSED IS NULL)
+                            AND TOP_LEVEL_SOURCE = :source_url
+                        """.format(LINKS_TO_SCRAP_TABLE)
+                        
+                        # Add user_id filter if provided
+                        params = {"source_url": top_level_source_url}
+                        if user_id:
+                            query += " AND USER_ID = :user_id"
+                            params["user_id"] = user_id
+                        
+                        # Add row limit
+                        query += " FETCH FIRST {0} ROWS ONLY".format(batch_size)
+                        
+                        # First, check the count to avoid unnecessary cursor creation
+                        count_query = """
+                            SELECT COUNT(*) FROM {0}
+                            WHERE (IS_PROCESSED = 'false' OR IS_PROCESSED IS NULL)
+                            AND TOP_LEVEL_SOURCE = :source_url
+                        """.format(LINKS_TO_SCRAP_TABLE)
+                        
+                        if user_id:
+                            count_query += " AND USER_ID = :user_id"
+                        
+                        cursor.execute(count_query, params)
+                        unprocessed_count = cursor.fetchone()[0]
+                        
+                        if unprocessed_count == 0:
+                            # No unprocessed links found, wait and check again
+                            consecutive_empty_cycles += 1
+                            print(f"No unprocessed links found. Empty cycle #{consecutive_empty_cycles}/{max_consecutive_empty_cycles}")
+                            
+                            if consecutive_empty_cycles >= max_consecutive_empty_cycles:
+                                print(f"Reached maximum consecutive empty cycles ({max_consecutive_empty_cycles}). Exiting processing job.")
+                                break
+                            
+                            # Wait for a short time before checking again - reduced from 5 seconds to 2
+                            sleep_time = 2
+                            print(f"Waiting {sleep_time} seconds before checking for new links...")
+                            
+                            # Use stop_event.wait instead of time.sleep to respond to stop events
+                            if stop_event.wait(sleep_time):
+                                print("Stop event detected during wait. Exiting processing job.")
+                                break
+                            
+                            continue
+                        
+                        # Reset the consecutive empty cycles counter since we found links
+                        consecutive_empty_cycles = 0
+                        
+                        # Get a batch of unprocessed links
+                        cursor.execute(query, params)
+                        unprocessed_links = cursor.fetchall()
+                        print(f"Processing batch of {len(unprocessed_links)} links")
+                        
+                        batch_processed = 0
+                        batch_success = 0
+                        batch_errors = 0
+                        
+                        # Process each link in the batch
+                        for link_row in unprocessed_links:
+                            if stop_event.is_set():
+                                print(f"Stop event triggered. Exiting processing job for {top_level_source_url}.")
+                                break
+                            
+                            try:
+                                link_id, link_url, depth, top_level, source, link_user_id = link_row
+                                
+                                # Ensure link has user_id before processing
+                                effective_user_id = link_user_id or user_id
+                                
+                                if not effective_user_id:
+                                    print(f"No user_id available for link: {link_url}, skipping")
+                                    continue
+                                    
+                                if not link_user_id and user_id:
+                                    # Update the document in the database to include user_id
+                                    cursor.execute("""
+                                        UPDATE {0} SET USER_ID = :user_id
+                                        WHERE ID = :id
+                                    """.format(LINKS_TO_SCRAP_TABLE), id=link_id, user_id=user_id)
+                                    
+                                    connection.commit()
+                                
+                                # Create a link_doc dictionary to match the interface
+                                link_doc = {
+                                    'id': link_id,
+                                    'link': link_url,
+                                    'depth': depth,
+                                    'top_level_source': top_level,
+                                    'source_url': source,
+                                    'user_id': effective_user_id
+                                }
+        
+                                # Process the link
+                                result = scrape_single_link(connection, link_doc, effective_user_id)
+                                
+                                if result['status'] == 'success':
+                                    batch_success += 1
+                                    success_count += 1
+                                else:
+                                    # Already marked as failed in scrape_single_link
+                                    batch_errors += 1
+                                    error_count += 1
+                                
+                                batch_processed += 1
+                                links_processed += 1
+                                
+                            except Exception as e:
+                                # Catch any unexpected errors during processing
+                                error_msg = f"Unexpected error processing link {link_url}: {str(e)}"
+                                print(error_msg)
+                                tb = traceback.format_exc()
+                                traceback.print_exc()
+                                
+                                # Mark the link as failed
+                                try:
+                                    cursor.execute("""
+                                        UPDATE {0} SET
+                                            IS_PROCESSED = 'Failed',
+                                            PROCESSED_AT = CURRENT_TIMESTAMP,
+                                            ERROR = :error,
+                                            TRACEBACK = :traceback,
+                                            USER_ID = :user_id
+                                        WHERE ID = :id
+                                    """.format(LINKS_TO_SCRAP_TABLE),
+                                        id=link_id,
+                                        error=error_msg[:4000],
+                                        traceback=tb[:4000],
+                                        user_id=effective_user_id
+                                    )
+                                    connection.commit()
+                                except Exception as update_error:
+                                    print(f"Error updating link status: {str(update_error)}")
+                                
+                                batch_errors += 1
+                                error_count += 1
+                                batch_processed += 1
+                                links_processed += 1
+                            
+                            # Much shorter sleep between links
+                            time.sleep(0.1)
+                        
+                        print(f"Batch complete. Processed {batch_processed} links ({batch_success} successful, {batch_errors} errors).")
+                        
+                        # If the batch was smaller than the batch size, take a very short break before checking again
+                        if batch_processed < batch_size:
+                            sleep_time = 1  # Reduced from 3 seconds to 1
+                            print(f"Processed less than batch size. Waiting {sleep_time} seconds before continuing...")
+                            if stop_event.wait(sleep_time):
+                                print("Stop event detected during wait. Exiting processing job.")
+                                break
+                
+            except Exception as batch_error:
+                print(f"Error processing batch: {str(batch_error)}")
+                traceback.print_exc()
+                
+                # Shorter sleep before retrying
+                time.sleep(2)
+        
+        print(f"Processing job completed or stopped: {links_processed} links processed, {success_count} successful, {error_count} failed")
+        
+        # Return stats if we exit the loop
+        return {
+            'links_processed': links_processed,
+            'success_count': success_count,
+            'error_count': error_count
+        }
+            
+    except Exception as e:
+        print(f"Error in continuous processing job: {str(e)}")
+        traceback.print_exc()
+        return {
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }
+               
 @file_api.route('/recursive-crawl', methods=['POST'])
 @token_required
-def recursive_crawl(user_id):
-    connection = None
-    cursor = None
+def recursive_crawl(user_id, *args, **kwargs):  # Allow additional args
     try:
         print(f"Starting recursive crawl for user ID: {user_id}")
         
@@ -1804,123 +2376,188 @@ def recursive_crawl(user_id):
             print(f"Invalid URL format: {top_level_source_url}")
             return standardize_error_response(f'Invalid URL format: {top_level_source_url}', 'INVALID_URL', 400)
         
-        connection = get_oracle_connection()
-        cursor = connection.cursor()
-        
-        # Check if the URL has already been crawled completely
-        cursor.execute("""
-            SELECT COUNT(*) FROM {0}
-            WHERE TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
-        """.format(LINKS_TO_SCRAP_TABLE), source_url=top_level_source_url, user_id=user_id)
-        
-        links_count = cursor.fetchone()[0]
-        
-        cursor.execute("""
-            SELECT COUNT(*) FROM {0}
-            WHERE TOP_LEVEL_SOURCE = :source_url 
-            AND (IS_CRAWLED = 0 OR IS_CRAWLED IS NULL)
-            AND USER_ID = :user_id
-        """.format(LINKS_TO_SCRAP_TABLE), source_url=top_level_source_url, user_id=user_id)
-        
-        uncrawled_count = cursor.fetchone()[0]
-        
-        print(f"Found {links_count} total links and {uncrawled_count} uncrawled links")
-        
-        if links_count > 0 and uncrawled_count == 0:
-            print(f"URL already completely crawled: {top_level_source_url}")
-            return jsonify({
-                'status': 'info',
-                'message': f'URL {top_level_source_url} has already been completely crawled.',
-                'stats': {
-                    'total_links': links_count
-                },
-                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
-            })
-        
-        # Check if the URL exists in Links_to_scrap
-        cursor.execute("""
-            SELECT COUNT(*) FROM {0}
-            WHERE LINK = :link AND USER_ID = :user_id
-        """.format(LINKS_TO_SCRAP_TABLE), link=top_level_source_url, user_id=user_id)
-        
-        existing_link_count = cursor.fetchone()[0]
-        print(f"Existing link found: {existing_link_count > 0}")
-        
-        # If the URL is not in Links_to_scrap, add it as a new starting point
-        if existing_link_count == 0:
-            try:
-                print(f"Inserting initial URL to Links_to_scrap: {top_level_source_url}")
-                cursor.execute("""
-                    INSERT INTO {0} (
-                        LINK, ADDED_AT, IS_CRAWLED, IS_PROCESSED, 
-                        DEPTH, SOURCE_URL, TOP_LEVEL_SOURCE, USER_ID
-                    ) VALUES (
-                        :link, CURRENT_TIMESTAMP, 0, 'false',
-                        0, :source_url, :top_level_source, :user_id
-                    )
-                """.format(LINKS_TO_SCRAP_TABLE),
-                    link=top_level_source_url,
-                    source_url=top_level_source_url,
-                    top_level_source=top_level_source_url,
-                    user_id=user_id
-                )
-                
-                connection.commit()
-                print(f"URL inserted successfully: {top_level_source_url}")
-                
-            except Exception as e:
-                print(f"Error inserting URL: {str(e)}")
-                traceback.print_exc()
-                connection.rollback()
-                raise
-        
-        # Save the source URL and timestamp in the Source_Urls collection
+        # Perform immediate initial crawl to make the system feel more responsive
+        initial_links = []
         try:
-            print(f"Inserting/updating source URL in {SOURCE_URLS_TABLE}: {top_level_source_url}")
+            # Add user agent to avoid being blocked
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
             
-            # First check if the document already exists
-            cursor.execute("""
-                SELECT COUNT(*) FROM {0}
-                WHERE SOURCE_URL = :source_url AND USER_ID = :user_id
-            """.format(SOURCE_URLS_TABLE), source_url=top_level_source_url, user_id=user_id)
+            # Make immediate request to the URL with short timeout
+            print(f"Making immediate HTTP request to: {top_level_source_url}")
+            response = requests.get(top_level_source_url, headers=headers, timeout=10)
             
-            existing_source_count = cursor.fetchone()[0]
-            
-            if existing_source_count > 0:
-                # If exists, update the timestamp and page limit
-                cursor.execute("""
-                    UPDATE {0} SET 
-                        TIMESTAMP = CURRENT_TIMESTAMP, 
-                        PAGE_LIMIT = :page_limit
-                    WHERE SOURCE_URL = :source_url AND USER_ID = :user_id
-                """.format(SOURCE_URLS_TABLE),
-                    page_limit=page_limit,
-                    source_url=top_level_source_url,
-                    user_id=user_id
-                )
-                print(f"Updated timestamp and page limit for existing source URL record")
-            else:
-                # If not exists, create new entry
-                cursor.execute("""
-                    INSERT INTO {0} (
-                        SOURCE_URL, USER_ID, TIMESTAMP, PAGE_LIMIT
-                    ) VALUES (
-                        :source_url, :user_id, CURRENT_TIMESTAMP, :page_limit
-                    )
-                """.format(SOURCE_URLS_TABLE),
-                    source_url=top_level_source_url,
-                    user_id=user_id,
-                    page_limit=page_limit
-                )
-                print(f"Created new source URL record")
+            if response.status_code == 200:
+                # Extract the domain for same-domain filtering
+                original_domain = extract_domain(top_level_source_url)
                 
-            connection.commit()
+                # Get immediate links from the page
+                soup = BeautifulSoup(response.text, 'html.parser')
+                all_links = soup.find_all('a', href=True)
                 
-        except Exception as e:
-            print(f"Error inserting source URL: {str(e)}")
-            traceback.print_exc()
-            connection.rollback()
-            raise
+                # Quick extract of valid links
+                for link in all_links:
+                    href = link['href'].strip()
+                    if not href or href.startswith(('javascript:', 'mailto:', 'tel:', '#')):
+                        continue
+                        
+                    try:
+                        full_url = urljoin(top_level_source_url, href)
+                        link_domain = extract_domain(full_url)
+                        
+                        if link_domain != original_domain:
+                            continue
+                            
+                        if not is_valid_url(full_url) or not is_valid_content_url(full_url):
+                            continue
+                            
+                        initial_links.append(full_url)
+                    except:
+                        continue
+                        
+                initial_links = list(set(initial_links))
+                print(f"Quick initial crawl found {len(initial_links)} links")
+        except Exception as initial_error:
+            print(f"Initial crawl attempt encountered error: {str(initial_error)}")
+            # Continue with normal process even if initial crawl fails
+
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                # Check if the URL has already been crawled completely
+                cursor.execute("""
+                    SELECT COUNT(*) FROM {0}
+                    WHERE TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
+                """.format(LINKS_TO_SCRAP_TABLE), source_url=top_level_source_url, user_id=user_id)
+                
+                links_count = cursor.fetchone()[0]
+                
+                cursor.execute("""
+                    SELECT COUNT(*) FROM {0}
+                    WHERE TOP_LEVEL_SOURCE = :source_url 
+                    AND (IS_CRAWLED = 0 OR IS_CRAWLED IS NULL)
+                    AND USER_ID = :user_id
+                """.format(LINKS_TO_SCRAP_TABLE), source_url=top_level_source_url, user_id=user_id)
+                
+                uncrawled_count = cursor.fetchone()[0]
+                
+                print(f"Found {links_count} total links and {uncrawled_count} uncrawled links")
+                
+                if links_count > 0 and uncrawled_count == 0:
+                    print(f"URL already completely crawled: {top_level_source_url}")
+                    return jsonify({
+                        'status': 'info',
+                        'message': f'URL {top_level_source_url} has already been completely crawled.',
+                        'stats': {
+                            'total_links': links_count
+                        },
+                        'timestamp': datetime.now().isoformat()
+                    })
+                
+                # Check if the URL exists in Links_to_scrap
+                cursor.execute("""
+                    SELECT COUNT(*) FROM {0}
+                    WHERE LINK = :link AND USER_ID = :user_id
+                """.format(LINKS_TO_SCRAP_TABLE), link=top_level_source_url, user_id=user_id)
+                
+                existing_link_count = cursor.fetchone()[0]
+                print(f"Existing link found: {existing_link_count > 0}")
+                
+                # If the URL is not in Links_to_scrap, add it as a new starting point
+                if existing_link_count == 0:
+                    try:
+                        print(f"Inserting initial URL to Links_to_scrap: {top_level_source_url}")
+                        cursor.execute("""
+                            INSERT INTO {0} (
+                                LINK, ADDED_AT, IS_CRAWLED, IS_PROCESSED, 
+                                DEPTH, SOURCE_URL, TOP_LEVEL_SOURCE, USER_ID
+                            ) VALUES (
+                                :link, CURRENT_TIMESTAMP, 0, 'false',
+                                0, :source_url, :top_level_source, :user_id
+                            )
+                        """.format(LINKS_TO_SCRAP_TABLE),
+                            link=top_level_source_url,
+                            source_url=top_level_source_url,
+                            top_level_source=top_level_source_url,
+                            user_id=user_id
+                        )
+                        
+                        connection.commit()
+                        print(f"URL inserted successfully: {top_level_source_url}")
+                        
+                    except Exception as e:
+                        print(f"Error inserting URL: {str(e)}")
+                        traceback.print_exc()
+                        raise
+                
+                # Add any initial links we found (immediately improves responsiveness)
+                if initial_links:
+                    inserted_count = 0
+                    unique_links = list(set(initial_links))[:50]  # Limit to first 50 for quick start
+                    print(f"Inserting {len(unique_links)} initial links found during quick crawl")
+                    
+                    link_values = []
+                    for link in unique_links:
+                        link_values.append({
+                            'link': link,
+                            'top_level_source': top_level_source_url,
+                            'user_id': user_id,
+                            'source_url': top_level_source_url,
+                            'depth': 1,
+                            'has_text': 1 if contains_text_in_url(link) else 0
+                        })
+                    
+                    # Use batch insert for better performance
+                    if link_values:
+                        inserted_count = batch_insert_links(connection, link_values)
+                        print(f"Initially inserted {inserted_count} links during quick crawl")
+                
+                # Save the source URL and timestamp in the Source_Urls collection
+                try:
+                    print(f"Inserting/updating source URL in {SOURCE_URLS_TABLE}: {top_level_source_url}")
+                    
+                    # First check if the document already exists
+                    cursor.execute("""
+                        SELECT COUNT(*) FROM {0}
+                        WHERE SOURCE_URL = :source_url AND USER_ID = :user_id
+                    """.format(SOURCE_URLS_TABLE), source_url=top_level_source_url, user_id=user_id)
+                    
+                    existing_source_count = cursor.fetchone()[0]
+                    
+                    if existing_source_count > 0:
+                        # If exists, update the timestamp and page limit
+                        cursor.execute("""
+                            UPDATE {0} SET 
+                                TIMESTAMP = CURRENT_TIMESTAMP, 
+                                PAGE_LIMIT = :page_limit
+                            WHERE SOURCE_URL = :source_url AND USER_ID = :user_id
+                        """.format(SOURCE_URLS_TABLE),
+                            page_limit=page_limit,
+                            source_url=top_level_source_url,
+                            user_id=user_id
+                        )
+                        print(f"Updated timestamp and page limit for existing source URL record")
+                    else:
+                        # If not exists, create new entry
+                        cursor.execute("""
+                            INSERT INTO {0} (
+                                SOURCE_URL, USER_ID, TIMESTAMP, PAGE_LIMIT
+                            ) VALUES (
+                                :source_url, :user_id, CURRENT_TIMESTAMP, :page_limit
+                            )
+                        """.format(SOURCE_URLS_TABLE),
+                            source_url=top_level_source_url,
+                            user_id=user_id,
+                            page_limit=page_limit
+                        )
+                        print(f"Created new source URL record")
+                        
+                    connection.commit()
+                        
+                except Exception as e:
+                    print(f"Error inserting source URL: {str(e)}")
+                    traceback.print_exc()
+                    raise
         
         # Check if user has an active job
         if user_has_active_job(user_id):
@@ -1936,7 +2573,8 @@ def recursive_crawl(user_id):
                 return jsonify({
                     'status': 'queued',
                     'message': f'URL {top_level_source_url} has been added to the processing queue with a limit of {page_limit} pages.',
-                    'timestamp': datetime.datetime.now().isoformat(),
+                    'initial_links_found': len(initial_links),
+                    'timestamp': datetime.now().isoformat(),
                     'source_url': top_level_source_url,
                     'page_limit': page_limit
                 })
@@ -1952,7 +2590,8 @@ def recursive_crawl(user_id):
                 return jsonify({
                     'status': 'success',
                     'message': f'Continuous crawling started for {top_level_source_url} with a limit of {page_limit} pages',
-                    'timestamp': datetime.datetime.now().isoformat(),
+                    'initial_links_found': len(initial_links),
+                    'timestamp': datetime.now().isoformat(),
                     'source_url': top_level_source_url,
                     'page_limit': page_limit
                 })
@@ -1962,16 +2601,207 @@ def recursive_crawl(user_id):
     except Exception as e:
         traceback_str = traceback.format_exc()
         print(f"Error in crawling: {str(e)}\n{traceback_str}")
-        if connection:
-            connection.rollback()
         return standardize_error_response(str(e), 'SERVER_ERROR', 500)
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
+    
+@file_api.route('/progress-bar', methods=['GET'])
+def get_progress_bar():
+    """
+    Get the progress information for crawling and scraping operations
+    to display in a progress bar in the frontend.
+    """
+    try:
+        # Get source URL from query parameters
+        source_url = request.args.get('source_url')
 
-            
+        if not source_url:
+            return jsonify({
+                'status': 'error',
+                'message': 'source_url is required.',
+                'timestamp': datetime.now().isoformat()
+            }), 400
+
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                # Get the last progress record for this source URL
+                cursor.execute("""
+                    SELECT 
+                        CRAWL_PROGRESS, SCRAPE_PROGRESS, CRAWLED_COUNT, SCRAPED_COUNT, 
+                        TOTAL_LINKS, OPERATION_STATUS, TO_CHAR(TIMESTAMP, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as TIMESTAMP
+                    FROM {0}
+                    WHERE SOURCE_URL = :source_url
+                    ORDER BY TIMESTAMP DESC
+                    FETCH FIRST 1 ROW ONLY
+                """.format(PROGRESS_HISTORY_TABLE), source_url=source_url)
+                
+                last_progress_row = cursor.fetchone()
+                last_progress = None
+                if last_progress_row:
+                    last_progress = {
+                        'crawl_progress': last_progress_row[0],
+                        'scrape_progress': last_progress_row[1],
+                        'crawled_count': last_progress_row[2],
+                        'scraped_count': last_progress_row[3],
+                        'total_links': last_progress_row[4],
+                        'operation_status': last_progress_row[5],
+                        'timestamp': last_progress_row[6]
+                    }
+
+                # Get total links for this source URL
+                cursor.execute("""
+                    SELECT COUNT(*) FROM {0}
+                    WHERE TOP_LEVEL_SOURCE = :source_url
+                """.format(LINKS_TO_SCRAP_TABLE), source_url=source_url)
+                
+                total_links = cursor.fetchone()[0]
+
+                # Skip calculation if no links found
+                if total_links == 0:
+                    current_time = datetime.datetime.now()
+                    return jsonify({
+                        'status': 'pending',
+                        'message': f'No links found for {source_url}',
+                        'crawl_progress': 0,
+                        'scrape_progress': 0,
+                        'crawled_count': 0,
+                        'total_links': 0,
+                        'scraped_count': 0,
+                        'change_since_last': {
+                            'crawl_progress_change': 0,
+                            'scrape_progress_change': 0,
+                            'links_per_minute': 0,
+                            'scrape_per_minute': 0,
+                            'time_since_last': 0,
+                            'estimated_completion_time': None,
+                            'estimated_completion_minutes': None,
+                            'estimated_time_readable': 'Unknown'
+                        },
+                        'timestamp': current_time.isoformat()
+                    })
+
+                # Calculate crawling progress
+                cursor.execute("""
+                    SELECT COUNT(*) FROM {0}
+                    WHERE TOP_LEVEL_SOURCE = :source_url AND IS_CRAWLED = 1
+                """.format(LINKS_TO_SCRAP_TABLE), source_url=source_url)
+                
+                crawled_count = cursor.fetchone()[0]
+                crawl_progress = round((crawled_count / total_links) * 100, 1) if total_links > 0 else 0
+
+                # Calculate scraping progress based on is_processed field
+                cursor.execute("""
+                    SELECT COUNT(*) FROM {0}
+                    WHERE TOP_LEVEL_SOURCE = :source_url AND IS_PROCESSED = 'true'
+                """.format(LINKS_TO_SCRAP_TABLE), source_url=source_url)
+                
+                scraped_count = cursor.fetchone()[0]
+                scrape_progress = round((scraped_count / total_links) * 100, 1) if total_links > 0 else 0
+
+                # Extract user_id from the links collection if available
+                cursor.execute("""
+                    SELECT DISTINCT USER_ID FROM {0}
+                    WHERE TOP_LEVEL_SOURCE = :source_url
+                    FETCH FIRST 1 ROW ONLY
+                """.format(LINKS_TO_SCRAP_TABLE), source_url=source_url)
+                
+                user_row = cursor.fetchone()
+                user_id = user_row[0] if user_row else None
+                
+                # Check if this URL is in the queue
+                queue_status = None
+                in_queue = False
+                queue_position = None
+                is_active = False
+                
+                if user_id:
+                    # Check if it's in the active jobs list
+                    if user_id in active_user_jobs and source_url in active_user_jobs[user_id]:
+                        is_active = True
+                    
+                    # Check if it's in the queue
+                    cursor.execute("""
+                        SELECT ID, PROCESSED, PROCESSING_STARTED
+                        FROM {0}
+                        WHERE USER_ID = :user_id AND SOURCE_URL = :source_url
+                    """.format(PROCESSING_QUEUE_TABLE), user_id=user_id, source_url=source_url)
+                    
+                    queue_row = cursor.fetchone()
+                    if queue_row:
+                        queue_id, is_processed, is_processing = queue_row
+                        in_queue = True
+                        
+                        # If it's not actively processing, get its position in the queue
+                        if is_processed == 0 and is_processing is None:
+                            cursor.execute("""
+                                SELECT COUNT(*) FROM {0}
+                                WHERE USER_ID = :user_id
+                                AND PROCESSED = 0
+                                AND PROCESSING_STARTED IS NULL
+                                AND ADDED_AT < (
+                                    SELECT ADDED_AT FROM {0}
+                                    WHERE ID = :queue_id
+                                )
+                            """.format(PROCESSING_QUEUE_TABLE), user_id=user_id, queue_id=queue_id)
+                            
+                            ahead_count = cursor.fetchone()[0]
+                            queue_position = ahead_count + 1
+
+                # Determine the overall status
+                if is_active:
+                    if crawled_count < total_links:
+                        status = 'crawling'
+                    else:
+                        status = 'processing'
+                elif in_queue:
+                    status = 'queued'
+                elif crawl_progress >= 100 and scrape_progress >= 100:
+                    status = 'completed'
+                else:
+                    status = 'pending'
+
+                # Save current progress to history
+                cursor.execute("""
+                    INSERT INTO {0} (
+                        SOURCE_URL, TIMESTAMP, CRAWL_PROGRESS, SCRAPE_PROGRESS,
+                        CRAWLED_COUNT, SCRAPED_COUNT, TOTAL_LINKS, OPERATION_STATUS
+                    ) VALUES (
+                        :source_url, CURRENT_TIMESTAMP, :crawl_progress, :scrape_progress,
+                        :crawled_count, :scraped_count, :total_links, :operation_status
+                    )
+                """.format(PROGRESS_HISTORY_TABLE),
+                    source_url=source_url,
+                    crawl_progress=crawl_progress,
+                    scrape_progress=scrape_progress,
+                    crawled_count=crawled_count,
+                    scraped_count=scraped_count,
+                    total_links=total_links,
+                    operation_status=status
+                )
+
+                # Return the response
+                return jsonify({
+                    'status': 'success',
+                    'operation_status': status,
+                    'crawl_progress': crawl_progress,
+                    'scrape_progress': scrape_progress,
+                    'crawled_count': crawled_count,
+                    'total_links': total_links,
+                    'scraped_count': scraped_count,
+                    'is_active': is_active,
+                    'in_queue': in_queue,
+                    'queue_position': queue_position,
+                    'timestamp': datetime.now().isoformat()
+                })
+
+    except Exception as e:
+        print(f"Error in progress_bar: {str(e)}")
+        traceback.print_exc()
+        return jsonify({
+            'status': 'error',
+            'message': str(e),
+            'error_details': traceback.format_exc(),
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
 @file_api.route('/process-all-links', methods=['POST'])
 @token_required
 def process_all_links(user_id):
@@ -1981,14 +2811,12 @@ def process_all_links(user_id):
     Includes an option to delay the start of processing.
     If a job is already active for the user, the new URL will be queued.
     """
-    connection = None
-    cursor = None
     try:
         print(f"Starting process_all_links for user ID: {user_id}")
         
         # Get the delay parameter (default: 60 seconds) and source_url
         data = request.get_json() or {}
-        delay_seconds = data.get('delay', 60)
+        delay_seconds = data.get('delay', 5)  # Reduced from 60 to 5 seconds for better performance
         source_url = data.get('source_url')
         
         print(f"Request data: delay={delay_seconds}, source_url={source_url}")
@@ -1998,31 +2826,30 @@ def process_all_links(user_id):
             return jsonify({
                 'status': 'error',
                 'message': 'source_url is required in the POST body.',
-                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
+                'timestamp': datetime.now().isoformat()
             }), 400
 
-        connection = get_oracle_connection()
-        cursor = connection.cursor()
-        
-        # Check how many unprocessed links exist for this user and source
-        cursor.execute("""
-            SELECT COUNT(*) FROM {0}
-            WHERE (IS_PROCESSED = 'false' OR IS_PROCESSED IS NULL)
-            AND TOP_LEVEL_SOURCE = :source_url
-            AND USER_ID = :user_id
-        """.format(LINKS_TO_SCRAP_TABLE), source_url=source_url, user_id=user_id)
-        
-        unprocessed_count = cursor.fetchone()[0]
-        
-        print(f"Found {unprocessed_count} unprocessed links for source: {source_url}, user: {user_id}")
-        
-        if unprocessed_count == 0:
-            print(f"No unprocessed links found for {source_url}")
-            return jsonify({
-                'status': 'complete',
-                'message': f'No unprocessed links found for {source_url}',
-                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
-            })
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                # Check how many unprocessed links exist for this user and source
+                cursor.execute("""
+                    SELECT COUNT(*) FROM {0}
+                    WHERE (IS_PROCESSED = 'false' OR IS_PROCESSED IS NULL)
+                    AND TOP_LEVEL_SOURCE = :source_url
+                    AND USER_ID = :user_id
+                """.format(LINKS_TO_SCRAP_TABLE), source_url=source_url, user_id=user_id)
+                
+                unprocessed_count = cursor.fetchone()[0]
+                
+                print(f"Found {unprocessed_count} unprocessed links for source: {source_url}, user: {user_id}")
+                
+                if unprocessed_count == 0:
+                    print(f"No unprocessed links found for {source_url}")
+                    return jsonify({
+                        'status': 'complete',
+                        'message': f'No unprocessed links found for {source_url}',
+                        'timestamp': datetime.now().isoformat()
+                    })
         
         # Check if user has an active job
         if user_has_active_job(user_id):
@@ -2035,136 +2862,49 @@ def process_all_links(user_id):
                 return jsonify({
                     'status': 'queued',
                     'message': f'URL {source_url} has been added to the processing queue.',
-                    'timestamp': datetime.datetime.now().isoformat(),  # Fixed datetime usage
+                    'timestamp': datetime.now().isoformat(),
                     'source_url': source_url
                 })
             else:
                 return jsonify({
                     'status': 'error',
                     'message': f'Failed to add URL {source_url} to the queue.',
-                    'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
+                    'timestamp': datetime.now().isoformat()
                 }), 500
         else:
             print(f"No active job for user {user_id}. Starting processing for: {source_url} with delay: {delay_seconds}s")
             
             # Start processing with the specified delay
-            result = start_crawling_and_processing(user_id, source_url, delay_seconds)
+            result = start_crawling_and_processing(user_id, source_url)
             
             if result:
                 return jsonify({
                     'status': 'success',
                     'message': f'Continuous processing started for {source_url} with a delay of {delay_seconds} seconds',
-                    'timestamp': datetime.datetime.now().isoformat(),  # Fixed datetime usage
+                    'timestamp': datetime.now().isoformat(),
                     'source_url': source_url
                 })
             else:
                 return jsonify({
                     'status': 'error',
                     'message': f'Failed to start processing for {source_url}',
-                    'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
+                    'timestamp': datetime.now().isoformat()
                 }), 500
     
     except Exception as e:
         traceback_str = traceback.format_exc()
         print(f"Error in processing: {str(e)}\n{traceback_str}")
-        if connection:
-            connection.rollback()
         return jsonify({
             'status': 'error',
             'message': str(e),
             'traceback': traceback_str,
-            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
+            'timestamp': datetime.now().isoformat()
         }), 500
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
-
-@file_api.route('/queue-status', methods=['GET'])
-@token_required
-def get_queue_status(user_id):
-    """Get the status of the processing queue for the authenticated user"""
-    connection = None
-    cursor = None
-    try:
-        connection = get_oracle_connection()
-        cursor = connection.cursor()
-        
-        # Get all queued items for this user
-        cursor.execute("""
-            SELECT SOURCE_URL, 
-                   TO_CHAR(ADDED_AT, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as ADDED_AT, 
-                   PROCESSED, 
-                   TO_CHAR(PROCESSING_STARTED, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as PROCESSING_STARTED,
-                   PAGE_LIMIT
-            FROM {0}
-            WHERE USER_ID = :user_id
-            ORDER BY ADDED_AT ASC
-        """.format(PROCESSING_QUEUE_TABLE), user_id=user_id)
-        
-        queue_items = []
-        for row in cursor.fetchall():
-            source_url, added_at, processed, processing_started, page_limit = row
-            
-            # Determine status field for each item
-            status = None
-            if processed == 1:
-                status = 'Completed'
-            elif processing_started is not None:
-                status = 'In Progress'
-            else:
-                status = 'Queued'
-                
-            # Add to result list
-            queue_items.append({
-                'source_url': source_url,
-                'added_at': added_at,
-                'processed': processed == 1,  # Convert to boolean
-                'processing_started': processing_started,
-                'page_limit': page_limit,
-                'status': status
-            })
-        
-        # Check if there's an active job
-        has_active_job = user_has_active_job(user_id)
-        
-        # If there's an active job, get its source URL
-        active_job_url = None
-        if has_active_job and user_id in active_user_jobs:
-            active_job_url = list(active_user_jobs[user_id])[0] if active_user_jobs[user_id] else None
-        
-        return jsonify({
-            'status': 'success',
-            'queue': queue_items,
-            'has_active_job': has_active_job,
-            'active_job_url': active_job_url,
-            'queue_length': len(queue_items),
-            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
-        })
-    except Exception as e:
-        print(f"Error getting queue status: {str(e)}")
-        traceback.print_exc()
-        if connection:
-            connection.rollback()
-        return jsonify({
-            'status': 'error',
-            'message': str(e),
-            'traceback': traceback.format_exc(),
-            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
-        }), 500
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
-
+    
 @file_api.route('/source-url-status', methods=['GET'])
 @token_required
 def get_source_url_status(user_id):
     """Get the status of a specific source URL for the authenticated user"""
-    connection = None
-    cursor = None
     try:
         print(f"Getting source URL status for user: {user_id}")
         
@@ -2176,117 +2916,116 @@ def get_source_url_status(user_id):
             return jsonify({
                 'status': 'error',
                 'message': 'source_url is required.',
-                'timestamp': datetime.datetime.now().isoformat()
+                'timestamp': datetime.now().isoformat()
             }), 400
         
         print(f"Checking status for source URL: {source_url}")
         
-        connection = get_oracle_connection()
-        cursor = connection.cursor()
-
-        # Count total URLs associated with this source for this user
-        cursor.execute("""
-            SELECT COUNT(*) FROM {0}
-            WHERE TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
-        """.format(LINKS_TO_SCRAP_TABLE), source_url=source_url, user_id=user_id)
-        
-        total_urls = cursor.fetchone()[0]
-        
-        # Count successfully processed URLs for this source
-        cursor.execute("""
-            SELECT COUNT(*) FROM {0}
-            WHERE TOP_LEVEL_SOURCE = :source_url 
-            AND IS_PROCESSED = 'true'
-            AND USER_ID = :user_id
-        """.format(LINKS_TO_SCRAP_TABLE), source_url=source_url, user_id=user_id)
-        
-        successful_processed = cursor.fetchone()[0]
-        
-        # Count failed processed URLs for this source
-        cursor.execute("""
-            SELECT COUNT(*) FROM {0}
-            WHERE TOP_LEVEL_SOURCE = :source_url 
-            AND IS_PROCESSED = 'Failed'
-            AND USER_ID = :user_id
-        """.format(LINKS_TO_SCRAP_TABLE), source_url=source_url, user_id=user_id)
-        
-        failed_processed = cursor.fetchone()[0]
-        
-        # Calculate total processed (successful + failed)
-        total_processed = successful_processed + failed_processed
-        
-        # Count scraped URLs for this source
-        cursor.execute("""
-            SELECT COUNT(*) FROM {0}
-            WHERE TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
-        """.format(SCRAPPED_TEXT_TABLE), source_url=source_url, user_id=user_id)
-        
-        total_scrapped = cursor.fetchone()[0]
-        
-        print(f"Stats: Total URLs: {total_urls}, Successful: {successful_processed}, Failed: {failed_processed}, Total Processed: {total_processed}, Scrapped: {total_scrapped}")
-        
-        # Check if URL is in the queue
-        cursor.execute("""
-            SELECT COUNT(*), MIN(PROCESSED), MIN(PROCESSING_STARTED)
-            FROM {0}
-            WHERE USER_ID = :user_id AND SOURCE_URL = :source_url
-        """.format(PROCESSING_QUEUE_TABLE), user_id=user_id, source_url=source_url)
-        
-        queue_count, is_processed, is_processing = cursor.fetchone()
-        queue_item_exists = queue_count > 0
-        
-        # Determine the status
-        if total_urls == 0:
-            # If no URLs are found for this source, it's pending
-            status = 'Pending'
-        elif total_processed == total_urls:
-            # Only mark as "Completed" if all URLs are processed (either successfully or failed)
-            status = 'Completed'
-        else:
-            # Check if it's actively being processed
-            is_active = False
-            if user_id in active_user_jobs and source_url in active_user_jobs[user_id]:
-                is_active = True
-                status = 'In Progress'
-            # Check if it's in the queue but not active
-            elif queue_item_exists and is_processed == 0 and is_processing is None:
-                status = 'Queued'
-            else:
-                # Otherwise, it's still pending
-                status = 'Pending'
-        
-        print(f"Source status determined as: {status}")
-        
-        # Get queue position if applicable
-        queue_position = None
-        if status == 'Queued' and queue_item_exists:
-            # Count how many unprocessed items are ahead in the queue
-            cursor.execute("""
-                SELECT COUNT(*) FROM {0} q1
-                WHERE q1.USER_ID = :user_id
-                  AND q1.PROCESSED = 0
-                  AND q1.PROCESSING_STARTED IS NULL
-                  AND q1.ADDED_AT < (
-                      SELECT q2.ADDED_AT FROM {0} q2
-                      WHERE q2.USER_ID = :user_id 
-                        AND q2.SOURCE_URL = :source_url
-                        AND q2.PROCESSED = 0
-                        AND q2.PROCESSING_STARTED IS NULL
-                  )
-            """.format(PROCESSING_QUEUE_TABLE), user_id=user_id, source_url=source_url)
-            
-            ahead_count = cursor.fetchone()[0]
-            queue_position = ahead_count + 1  # Add 1 for human-readable position (1-based indexing)
-        
-        # Get page limit for this source
-        cursor.execute("""
-            SELECT PAGE_LIMIT FROM {0}
-            WHERE USER_ID = :user_id AND SOURCE_URL = :source_url
-        """.format(SOURCE_URLS_TABLE), user_id=user_id, source_url=source_url)
-        
-        row = cursor.fetchone()
-        page_limit = row[0] if row else None
-        
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                # Count total URLs associated with this source for this user
+                cursor.execute("""
+                    SELECT COUNT(*) FROM {0}
+                    WHERE TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
+                """.format(LINKS_TO_SCRAP_TABLE), source_url=source_url, user_id=user_id)
+                
+                total_urls = cursor.fetchone()[0]
+                
+                # Count successfully processed URLs for this source
+                cursor.execute("""
+                    SELECT COUNT(*) FROM {0}
+                    WHERE TOP_LEVEL_SOURCE = :source_url 
+                    AND IS_PROCESSED = 'true'
+                    AND USER_ID = :user_id
+                """.format(LINKS_TO_SCRAP_TABLE), source_url=source_url, user_id=user_id)
+                
+                successful_processed = cursor.fetchone()[0]
+                
+                # Count failed processed URLs for this source
+                cursor.execute("""
+                    SELECT COUNT(*) FROM {0}
+                    WHERE TOP_LEVEL_SOURCE = :source_url 
+                    AND IS_PROCESSED = 'Failed'
+                    AND USER_ID = :user_id
+                """.format(LINKS_TO_SCRAP_TABLE), source_url=source_url, user_id=user_id)
+                
+                failed_processed = cursor.fetchone()[0]
+                
+                # Calculate total processed (successful + failed)
+                total_processed = successful_processed + failed_processed
+                
+                # Count scraped URLs for this source
+                cursor.execute("""
+                    SELECT COUNT(*) FROM {0}
+                    WHERE TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
+                """.format(SCRAPPED_TEXT_TABLE), source_url=source_url, user_id=user_id)
+                
+                total_scrapped = cursor.fetchone()[0]
+                
+                print(f"Stats: Total URLs: {total_urls}, Successful: {successful_processed}, Failed: {failed_processed}, Total Processed: {total_processed}, Scrapped: {total_scrapped}")
+                
+                # Check if URL is in the queue
+                cursor.execute("""
+                    SELECT COUNT(*), MIN(PROCESSED), MIN(PROCESSING_STARTED)
+                    FROM {0}
+                    WHERE USER_ID = :user_id AND SOURCE_URL = :source_url
+                """.format(PROCESSING_QUEUE_TABLE), user_id=user_id, source_url=source_url)
+                
+                queue_count, is_processed, is_processing = cursor.fetchone()
+                queue_item_exists = queue_count > 0
+                
+                # Determine the status
+                if total_urls == 0:
+                    # If no URLs are found for this source, it's pending
+                    status = 'Pending'
+                elif total_processed == total_urls:
+                    # Only mark as "Completed" if all URLs are processed (either successfully or failed)
+                    status = 'Completed'
+                else:
+                    # Check if it's actively being processed
+                    is_active = False
+                    if user_id in active_user_jobs and source_url in active_user_jobs[user_id]:
+                        is_active = True
+                        status = 'In Progress'
+                    # Check if it's in the queue but not active
+                    elif queue_item_exists and is_processed == 0 and is_processing is None:
+                        status = 'Queued'
+                    else:
+                        # Otherwise, it's still pending
+                        status = 'Pending'
+                
+                print(f"Source status determined as: {status}")
+                
+                # Get queue position if applicable
+                queue_position = None
+                if status == 'Queued' and queue_item_exists:
+                    # Count how many unprocessed items are ahead in the queue
+                    cursor.execute("""
+                        SELECT COUNT(*) FROM {0} q1
+                        WHERE q1.USER_ID = :user_id
+                          AND q1.PROCESSED = 0
+                          AND q1.PROCESSING_STARTED IS NULL
+                          AND q1.ADDED_AT < (
+                              SELECT q2.ADDED_AT FROM {0} q2
+                              WHERE q2.USER_ID = :user_id 
+                                AND q2.SOURCE_URL = :source_url
+                                AND q2.PROCESSED = 0
+                                AND q2.PROCESSING_STARTED IS NULL
+                          )
+                    """.format(PROCESSING_QUEUE_TABLE), user_id=user_id, source_url=source_url)
+                    
+                    ahead_count = cursor.fetchone()[0]
+                    queue_position = ahead_count + 1  # Add 1 for human-readable position (1-based indexing)
+                
+                # Get page limit for this source
+                cursor.execute("""
+                    SELECT PAGE_LIMIT FROM {0}
+                    WHERE USER_ID = :user_id AND SOURCE_URL = :source_url
+                """.format(SOURCE_URLS_TABLE), user_id=user_id, source_url=source_url)
+                
+                row = cursor.fetchone()
+                page_limit = row[0] if row else None
+                
         return jsonify({
             'status': 'success',
             'source_url': source_url,
@@ -2300,491 +3039,229 @@ def get_source_url_status(user_id):
                 'queue_position': queue_position,
                 'page_limit': page_limit
             },
-            'timestamp': datetime.datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat()
         })
     except Exception as e:
         print(f"Error getting source URL status: {str(e)}")
         traceback.print_exc()
-        if connection:
-            connection.rollback()
         return jsonify({
             'status': 'error',
             'message': str(e),
             'traceback': traceback.format_exc(),
-            'timestamp': datetime.datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat()
         }), 500
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
 
-@file_api.route('/stop-crawling', methods=['POST'])
+
+
+@file_api.route('/get-scrapped-links', methods=['GET'])
 @token_required
-def stop_crawling(user_id):
-    """Stop the continuous crawling for a specific source URL"""
+def realtime_scrapped_links(user_id):
+    """Get the count of scraped links with optimized DB connection"""
     try:
-        print(f"Request to stop crawling for user: {user_id}")
-        
-        data = request.get_json()
-        if not data or 'source_url' not in data:
-            print("source_url is missing in request body")
-            return jsonify({
-                'status': 'error',
-                'message': 'source_url is required in the POST body.',
-                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
-            }), 400
-            
-        source_url = data['source_url']
-        print(f"Stopping crawling for source URL: {source_url}")
-        
-        # Create user-specific key
-        crawl_key = f"{user_id}:{source_url}"
-        
-        if crawl_key in crawling_events:
-            print(f"Found crawling job for {crawl_key}, setting stop event")
-            crawling_events[crawl_key].set()
-            
-            # Remove from active jobs list if it exists
-            if user_id in active_user_jobs and source_url in active_user_jobs[user_id]:
-                active_user_jobs[user_id].remove(source_url)
-                if not active_user_jobs[user_id]:
-                    del active_user_jobs[user_id]
-            
-            # Check if there are more URLs in the queue and start the next one
-            start_next = mark_as_complete_and_process_next(user_id, source_url)
-            
-            return jsonify({
-                'status': 'success',
-                'message': f'Crawling for {source_url} has been stopped.',
-                'next_started': start_next,
-                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
-            })
-        else:
-            print(f"No active crawling found for {crawl_key}")
-            return jsonify({
-                'status': 'error',
-                'message': f'No active crawling found for {source_url}',
-                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
-            }), 404
-            
-    except Exception as e:
-        print(f"Error stopping crawling: {str(e)}")
-        traceback.print_exc()
-        return jsonify({
-            'status': 'error',
-            'message': str(e),
-            'traceback': traceback.format_exc(),
-            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
-        }), 500
-
-@file_api.route('/progress-bar', methods=['GET'])
-def get_progress_bar():
-    """
-    Get the progress information for crawling and scraping operations
-    to display in a progress bar in the frontend.
-    """
-    connection = None
-    cursor = None
-    try:
-        # Get source URL from query parameters
         source_url = request.args.get('source_url')
-
-        if not source_url:
-            return jsonify({
-                'status': 'error',
-                'message': 'source_url is required.',
-                'timestamp': datetime.now().isoformat()  # Fixed datetime usage
-            }), 400
-
-        connection = get_oracle_connection()
-        cursor = connection.cursor()
-
-        # Get the last progress record for this source URL
-        cursor.execute("""
-            SELECT 
-                CRAWL_PROGRESS, SCRAPE_PROGRESS, CRAWLED_COUNT, SCRAPED_COUNT, 
-                TOTAL_LINKS, OPERATION_STATUS, TO_CHAR(TIMESTAMP, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as TIMESTAMP
-            FROM {0}
-            WHERE SOURCE_URL = :source_url
-            ORDER BY TIMESTAMP DESC
-            FETCH FIRST 1 ROW ONLY
-        """.format(PROGRESS_HISTORY_TABLE), source_url=source_url)
         
-        last_progress_row = cursor.fetchone()
-        last_progress = None
-        if last_progress_row:
-            last_progress = {
-                'crawl_progress': last_progress_row[0],
-                'scrape_progress': last_progress_row[1],
-                'crawled_count': last_progress_row[2],
-                'scraped_count': last_progress_row[3],
-                'total_links': last_progress_row[4],
-                'operation_status': last_progress_row[5],
-                'timestamp': last_progress_row[6]
-            }
-
-        # Get total links for this source URL
-        cursor.execute("""
-            SELECT COUNT(*) FROM {0}
-            WHERE TOP_LEVEL_SOURCE = :source_url
-        """.format(LINKS_TO_SCRAP_TABLE), source_url=source_url)
-        
-        total_links = cursor.fetchone()[0]
-
-        # Skip calculation if no links found
-        if total_links == 0:
-            current_time = datetime.now()  # Fixed datetime usage
-            return jsonify({
-                'status': 'pending',
-                'message': f'No links found for {source_url}',
-                'crawl_progress': 0,
-                'scrape_progress': 0,
-                'crawled_count': 0,
-                'total_links': 0,
-                'scraped_count': 0,
-                'change_since_last': {
-                    'crawl_progress_change': 0,
-                    'scrape_progress_change': 0,
-                    'links_per_minute': 0,
-                    'scrape_per_minute': 0,
-                    'time_since_last': 0,
-                    'estimated_completion_time': None,
-                    'estimated_completion_minutes': None,
-                    'estimated_time_readable': 'Unknown'
-                },
-                'timestamp': current_time.isoformat()
-            })
-
-        # Calculate crawling progress
-        cursor.execute("""
-            SELECT COUNT(*) FROM {0}
-            WHERE TOP_LEVEL_SOURCE = :source_url AND IS_CRAWLED = 1
-        """.format(LINKS_TO_SCRAP_TABLE), source_url=source_url)
-        
-        crawled_count = cursor.fetchone()[0]
-        crawl_progress = round((crawled_count / total_links) * 100, 1) if total_links > 0 else 0
-
-        # Calculate scraping progress based on is_processed field
-        cursor.execute("""
-            SELECT COUNT(*) FROM {0}
-            WHERE TOP_LEVEL_SOURCE = :source_url AND IS_PROCESSED = 'true'
-        """.format(LINKS_TO_SCRAP_TABLE), source_url=source_url)
-        
-        scraped_count = cursor.fetchone()[0]
-        scrape_progress = round((scraped_count / total_links) * 100, 1) if total_links > 0 else 0
-
-        # Extract user_id from the links collection if available
-        cursor.execute("""
-            SELECT DISTINCT USER_ID FROM {0}
-            WHERE TOP_LEVEL_SOURCE = :source_url
-            FETCH FIRST 1 ROW ONLY
-        """.format(LINKS_TO_SCRAP_TABLE), source_url=source_url)
-        
-        user_row = cursor.fetchone()
-        user_id = user_row[0] if user_row else None
-        
-        # Check if this URL is in the queue
-        queue_status = None
-        in_queue = False
-        queue_position = None
-        is_active = False
-        
-        if user_id:
-            # Check if it's in the active jobs list
-            if user_id in active_user_jobs and source_url in active_user_jobs[user_id]:
-                is_active = True
-            
-            # Check if it's in the queue
-            cursor.execute("""
-                SELECT ID, PROCESSED, PROCESSING_STARTED
-                FROM {0}
-                WHERE USER_ID = :user_id AND SOURCE_URL = :source_url
-            """.format(PROCESSING_QUEUE_TABLE), user_id=user_id, source_url=source_url)
-            
-            queue_row = cursor.fetchone()
-            if queue_row:
-                queue_id, is_processed, is_processing = queue_row
-                in_queue = True
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                query = """
+                    SELECT COUNT(*) FROM {0}
+                    WHERE USER_ID = :user_id
+                """.format(SCRAPPED_TEXT_TABLE)
                 
-                # If it's not actively processing, get its position in the queue
-                if is_processed == 0 and is_processing is None:
-                    cursor.execute("""
-                        SELECT COUNT(*) FROM {0}
-                        WHERE USER_ID = :user_id
-                        AND PROCESSED = 0
-                        AND PROCESSING_STARTED IS NULL
-                        AND ADDED_AT < (
-                            SELECT ADDED_AT FROM {0}
-                            WHERE ID = :queue_id
-                        )
-                    """.format(PROCESSING_QUEUE_TABLE), user_id=user_id, queue_id=queue_id)
+                params = {'user_id': user_id}
+                
+                if source_url:
+                    query += " AND TOP_LEVEL_SOURCE = :source_url"
+                    params['source_url'] = source_url
                     
-                    ahead_count = cursor.fetchone()[0]
-                    queue_position = ahead_count + 1
-
-        # Determine the overall status
-        if is_active:
-            if crawled_count < total_links:
-                status = 'crawling'
-            else:
-                status = 'processing'
-        elif in_queue:
-            status = 'queued'
-        elif crawl_progress >= 100 and scrape_progress >= 100:
-            status = 'completed'
-        else:
-            status = 'pending'
-
-        # Calculate change in percentages since last check
-        current_timestamp = datetime.now()  # Fixed datetime usage
-        change_since_last = {
-            'crawl_progress_change': 0,
-            'scrape_progress_change': 0,
-            'links_per_minute': 0,
-            'scrape_per_minute': 0,
-            'time_since_last': 0, # seconds
-            'estimated_completion_time': None,
-            'estimated_completion_minutes': None,
-            'estimated_time_readable': 'Unknown'
-        }
-
-        if last_progress:
-            last_timestamp = datetime.strptime(last_progress['timestamp'], '%Y-%m-%dT%H:%M:%SZ')
-            time_diff_seconds = (current_timestamp - last_timestamp).total_seconds()
-            time_diff_minutes = time_diff_seconds / 60
-
-            change_since_last['crawl_progress_change'] = round(crawl_progress - last_progress['crawl_progress'], 1)
-            change_since_last['scrape_progress_change'] = round(scrape_progress - last_progress['scrape_progress'], 1)
-            change_since_last['time_since_last'] = round(time_diff_seconds, 1)
-
-            # Calculate rates (per minute)
-            if time_diff_minutes > 0:
-                links_diff = crawled_count - last_progress['crawled_count']
-                scrape_diff = scraped_count - last_progress['scraped_count']
-
-                change_since_last['links_per_minute'] = round(links_diff / time_diff_minutes, 2)
-                change_since_last['scrape_per_minute'] = round(scrape_diff / time_diff_minutes, 2)
-
-            # Calculate estimated completion time
-            links_remaining = total_links - crawled_count
-            scrape_remaining = total_links - scraped_count
-
-            # Estimate time for crawling (if not complete)
-            estimated_minutes_crawl = 0
-            if crawl_progress < 100 and change_since_last['links_per_minute'] > 0:
-                estimated_minutes_crawl = links_remaining / change_since_last['links_per_minute']
-
-            # Estimate time for scraping (if not complete)
-            estimated_minutes_scrape = 0
-            if scrape_progress < 100 and change_since_last['scrape_per_minute'] > 0:
-                estimated_minutes_scrape = scrape_remaining / change_since_last['scrape_per_minute']
-
-            # Total estimated time is the sum of remaining crawl and scrape time
-            total_estimated_minutes = estimated_minutes_crawl + estimated_minutes_scrape
-
-            if total_estimated_minutes > 0:
-                # Format the estimated completion time
-                change_since_last['estimated_completion_minutes'] = round(total_estimated_minutes, 1)
-
-                # Calculate the absolute timestamp for estimated completion
-                estimated_completion_time = current_timestamp + timedelta(minutes=total_estimated_minutes)
-                change_since_last['estimated_completion_time'] = estimated_completion_time.isoformat()
-
-                # Add human-readable estimate
-                if total_estimated_minutes < 1:
-                    change_since_last['estimated_time_readable'] = "Less than a minute"
-                elif total_estimated_minutes < 60:
-                    change_since_last['estimated_time_readable'] = f"~{round(total_estimated_minutes)} minutes"
-                else:
-                    hours = int(total_estimated_minutes // 60)
-                    minutes = int(total_estimated_minutes % 60)
-                    change_since_last['estimated_time_readable'] = f"~{hours}h {minutes}m"
-
-        # Save current progress to history
-        cursor.execute("""
-            INSERT INTO {0} (
-                SOURCE_URL, TIMESTAMP, CRAWL_PROGRESS, SCRAPE_PROGRESS,
-                CRAWLED_COUNT, SCRAPED_COUNT, TOTAL_LINKS, OPERATION_STATUS
-            ) VALUES (
-                :source_url, CURRENT_TIMESTAMP, :crawl_progress, :scrape_progress,
-                :crawled_count, :scraped_count, :total_links, :operation_status
-            )
-        """.format(PROGRESS_HISTORY_TABLE),
-            source_url=source_url,
-            crawl_progress=crawl_progress,
-            scrape_progress=scrape_progress,
-            crawled_count=crawled_count,
-            scraped_count=scraped_count,
-            total_links=total_links,
-            operation_status=status
-        )
-        
-        connection.commit()
-
-        # Return the response
+                cursor.execute(query, params)
+                scraped_count = cursor.fetchone()[0]
+                
         return jsonify({
             'status': 'success',
-            'operation_status': status,
-            'crawl_progress': crawl_progress,
-            'scrape_progress': scrape_progress,
-            'crawled_count': crawled_count,
-            'total_links': total_links,
-            'scraped_count': scraped_count,
-            'is_active': is_active,
-            'in_queue': in_queue,
-            'queue_position': queue_position,
-            'change_since_last': change_since_last,
-            'timestamp': current_timestamp.isoformat()
-        })
-
-    except Exception as e:
-        print(f"Error in progress_bar: {str(e)}")
-        traceback.print_exc()
-        if connection:
-            connection.rollback()
-        return jsonify({
-            'status': 'error',
-            'message': str(e),
-            'error_details': traceback.format_exc(),
-            'timestamp': datetime.now().isoformat()  # Fixed datetime usage
-        }), 500
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
-
-@file_api.route('/get-discovered-links', methods=['GET'])
-@token_required
-def get_discovered_links(user_id):
-    connection = None
-    cursor = None
-    try:
-        # Get the source_url parameter directly from the request
-        source_url = request.args.get('source_url')
-        
-        connection = get_oracle_connection()
-        cursor = connection.cursor()
-        
-        # Build query with user_id
-        query = """
-            SELECT LINK FROM {0}
-            WHERE USER_ID = :user_id
-        """.format(LINKS_TO_SCRAP_TABLE)
-        
-        params = {'user_id': user_id}
-        
-        if source_url:
-            query += " AND TOP_LEVEL_SOURCE = :source_url"
-            params['source_url'] = source_url
-        
-        # Execute query to get distinct links
-        cursor.execute(f"""
-            SELECT DISTINCT LINK FROM ({query})
-        """, params)
-        
-        discovered_links = [row[0] for row in cursor.fetchall()]
-        
-        # Count by domain
-        domains = {}
-        for link in discovered_links:
-            try:
-                domain = link.split('//', 1)[1].split('/', 1)[0] if '//' in link else link.split('/', 1)[0]
-                domains[domain] = domains.get(domain, 0) + 1
-            except:
-                continue
-        
-        # Convert to list of dictionaries for response
-        domain_stats = [{'domain': domain, 'count': count} for domain, count in domains.items()]
-        
-        return jsonify({
-            'status': 'success',
-            'total_links': len(discovered_links),
-            'domain_stats': domain_stats,
+            'scrapped_links': scraped_count,
             'source_url': source_url,
             'timestamp': datetime.now().isoformat()
         })
     except Exception as e:
-        print(f"Error getting discovered links: {str(e)}")
+        print(f"Error getting scraped links: {str(e)}")
         traceback.print_exc()
-        if connection:
-            connection.rollback()
         return standardize_error_response(str(e), 'DB_ERROR', 500)
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
 
-
-@file_api.route('/remove-from-queue', methods=['POST'])
+@file_api.route('/get-pending-links', methods=['GET'])
 @token_required
-def remove_from_queue(user_id):
-    """Remove a URL from the processing queue"""
-    connection = None
-    cursor = None
+def realtime_pending_links(user_id):
+    """Get the count of pending links with optimized DB connection"""
     try:
-        data = request.get_json()
-        if not data or 'source_url' not in data:
-            return jsonify({
-                'status': 'error',
-                'message': 'source_url is required in the request body.',
-                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
-            }), 400
+        source_url = request.args.get('source_url')
+        
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                query = """
+                    SELECT COUNT(*) FROM {0}
+                    WHERE (IS_PROCESSED = 'false' OR IS_PROCESSED IS NULL)
+                    AND USER_ID = :user_id
+                """.format(LINKS_TO_SCRAP_TABLE)
                 
-        source_url = data['source_url']
-        
-        connection = get_oracle_connection()
-        cursor = connection.cursor()
-        
-        # Check if the URL is in the queue and not being processed
-        cursor.execute("""
-            SELECT ID FROM {0}
-            WHERE USER_ID = :user_id 
-            AND SOURCE_URL = :source_url
-            AND PROCESSED = 0
-            AND PROCESSING_STARTED IS NULL
-        """.format(PROCESSING_QUEUE_TABLE), user_id=user_id, source_url=source_url)
-        
-        queue_row = cursor.fetchone()
-        
-        if not queue_row:
-            return jsonify({
-                'status': 'error',
-                'message': f'URL {source_url} is not in the queue or is already being processed.',
-                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
-            }), 404
+                params = {'user_id': user_id}
                 
-        # Remove the URL from the queue
-        cursor.execute("""
-            DELETE FROM {0}
-            WHERE ID = :id
-        """.format(PROCESSING_QUEUE_TABLE), id=queue_row[0])
-        
-        connection.commit()
-        
+                if source_url:
+                    query += " AND TOP_LEVEL_SOURCE = :source_url"
+                    params['source_url'] = source_url
+                    
+                cursor.execute(query, params)
+                pending_count = cursor.fetchone()[0]
+                
         return jsonify({
             'status': 'success',
-            'message': f'URL {source_url} has been removed from the queue.',
-            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
+            'pending_links': pending_count,
+            'source_url': source_url,
+            'timestamp': datetime.now().isoformat()
         })
     except Exception as e:
-        print(f"Error removing from queue: {str(e)}")
+        print(f"Error getting pending links: {str(e)}")
         traceback.print_exc()
-        if connection:
-            connection.rollback()
+        return standardize_error_response(str(e), 'DB_ERROR', 500)
+
+@file_api.route('/get-total-words-scrapped', methods=['GET'])
+@token_required
+def realtime_total_words_scrapped(user_id):
+    """Get the total word count with optimized DB query using the WORD_COUNT column"""
+    try:
+        source_url = request.args.get('source_url')
+        
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                # Build the base query that directly uses the WORD_COUNT column
+                query = """
+                    SELECT SUM(WORD_COUNT) AS total_words
+                    FROM {0}
+                    WHERE USER_ID = :user_id
+                """.format(SCRAPPED_TEXT_TABLE)
+                
+                params = {'user_id': user_id}
+                
+                if source_url:
+                    query += " AND TOP_LEVEL_SOURCE = :source_url"
+                    params['source_url'] = source_url
+                    
+                cursor.execute(query, params)
+                row = cursor.fetchone()
+                total_words = row[0] if row and row[0] else 0
+                
+                # Also get document count
+                count_query = """
+                    SELECT COUNT(*) 
+                    FROM {0}
+                    WHERE USER_ID = :user_id
+                """.format(SCRAPPED_TEXT_TABLE)
+                
+                if source_url:
+                    count_query += " AND TOP_LEVEL_SOURCE = :source_url"
+                    
+                cursor.execute(count_query, params)
+                doc_count = cursor.fetchone()[0] or 0
+                
         return jsonify({
-            'status': 'error',
-            'message': str(e),
-            'traceback': traceback.format_exc(),
-            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
-        }), 500
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
+            'status': 'success',
+            'total_words': total_words,
+            'document_count': doc_count,
+            'source_url': source_url,
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        print(f"Error getting total words: {str(e)}")
+        traceback.print_exc()
+        return standardize_error_response(str(e), 'DB_ERROR', 500)
+    
+@file_api.route('/get-discovered-links', methods=['GET'])
+@token_required
+def get_discovered_links(user_id):
+    """
+    Get counts and statistics for discovered links associated with a parent source URL
+    
+    Query params:
+    - source_url: The parent source URL to filter by
+    """
+    try:
+        # Get source URL parameter
+        source_url = request.args.get('source_url')
+        
+        # Validate required parameter
+        if not source_url:
+            return standardize_error_response('source_url parameter is required.', 'MISSING_PARAM', 400)
+        
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                # Get comprehensive link statistics in a single query
+                stats_query = f"""
+                    SELECT 
+                        COUNT(*) AS total_links,
+                        SUM(CASE WHEN IS_CRAWLED = 1 THEN 1 ELSE 0 END) AS crawled_links,
+                        SUM(CASE WHEN IS_PROCESSED = 'true' THEN 1 ELSE 0 END) AS processed_links,
+                        SUM(CASE WHEN IS_PROCESSED = 'Failed' THEN 1 ELSE 0 END) AS failed_links,
+                        SUM(CASE WHEN ERROR IS NOT NULL THEN 1 ELSE 0 END) AS error_count,
+                        SUM(CASE WHEN HAS_TEXT_IN_URL = 1 THEN 1 ELSE 0 END) AS text_indicator_count
+                    FROM {LINKS_TO_SCRAP_TABLE}
+                    WHERE TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
+                """
+                cursor.execute(stats_query, source_url=source_url, user_id=user_id)
+                stats_row = cursor.fetchone()
+                
+                if not stats_row:
+                    return jsonify({
+                        'status': 'success',
+                        'total_links': 0,
+                        'source_url': source_url,
+                        'timestamp': datetime.now().isoformat()
+                    })
+                
+                # Get domain statistics with optimized query
+                domain_query = """
+                    SELECT 
+                        CASE 
+                            WHEN INSTR(LINK, '//') > 0 THEN 
+                                LOWER(REGEXP_SUBSTR(SUBSTR(LINK, INSTR(LINK, '//') + 2), '[^/]+'))
+                            ELSE 
+                                LOWER(REGEXP_SUBSTR(LINK, '[^/]+'))
+                        END AS DOMAIN,
+                        COUNT(*) as COUNT
+                    FROM {0}
+                    WHERE TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
+                    GROUP BY CASE 
+                        WHEN INSTR(LINK, '//') > 0 THEN 
+                            LOWER(REGEXP_SUBSTR(SUBSTR(LINK, INSTR(LINK, '//') + 2), '[^/]+'))
+                        ELSE 
+                            LOWER(REGEXP_SUBSTR(LINK, '[^/]+'))
+                    END
+                    ORDER BY COUNT DESC
+                """.format(LINKS_TO_SCRAP_TABLE)
+                
+                cursor.execute(domain_query, source_url=source_url, user_id=user_id)
+                domain_stats = [{'domain': row[0], 'count': row[1]} for row in cursor.fetchall()]
+                
+                # Build response with just the counts and statistics
+                return jsonify({
+                    'status': 'success',
+                    'total_links': stats_row[0],
+                    'source_url': source_url,
+                    'stats': {
+                        'total': stats_row[0],
+                        'crawled': stats_row[1],
+                        'processed': stats_row[2],
+                        'failed': stats_row[3],
+                        'error_count': stats_row[4],
+                        'text_indicator_count': stats_row[5]
+                    },
+                    'crawl_progress': round((stats_row[1] / stats_row[0]) * 100, 1) if stats_row[0] > 0 else 0,
+                    'processing_progress': round((stats_row[2] / stats_row[0]) * 100, 1) if stats_row[0] > 0 else 0,
+                    'domain_stats': domain_stats,
+                    'timestamp': datetime.now().isoformat()
+                })
+                
+    except Exception as e:
+        print(f"Error getting discovered links counts: {str(e)}")
+        traceback.print_exc()
+        return standardize_error_response(str(e), 'SERVER_ERROR', 500)
 
 @file_api.route('/scrapped-sub-links', methods=['POST'])
 def scrapped_sub_links():
@@ -2792,15 +3269,13 @@ def scrapped_sub_links():
     Fetch links related to a specific source URL with pagination
     Returns 10 URLs at a time with their processing status
     """
-    connection = None
-    cursor = None
     try:
         data = request.get_json()
         if not data:
             return jsonify({
                 'status': 'error',
                 'message': 'Request body is required.',
-                'timestamp': datetime.now().isoformat()  # Fixed datetime usage
+                'timestamp': datetime.now().isoformat()
             }), 400
         
         source_url = data.get('source_url')
@@ -2811,56 +3286,55 @@ def scrapped_sub_links():
             return jsonify({
                 'status': 'error',
                 'message': 'source_url is required in the request body.',
-                'timestamp': datetime.now().isoformat()  # Fixed datetime usage
+                'timestamp': datetime.now().isoformat()
             }), 400
         
-        connection = get_oracle_connection()
-        cursor = connection.cursor()
-        
-        # Calculate pagination parameters
-        offset = (page - 1) * page_size
-        
-        # Get total count for pagination
-        cursor.execute("""
-            SELECT COUNT(*) FROM {0}
-            WHERE TOP_LEVEL_SOURCE = :source_url
-        """.format(LINKS_TO_SCRAP_TABLE), source_url=source_url)
-        
-        total_links = cursor.fetchone()[0]
-        
-        # Fetch the paginated links
-        cursor.execute(f"""
-            SELECT LINK, IS_PROCESSED 
-            FROM (
-                SELECT LINK, IS_PROCESSED, ROW_NUMBER() OVER (ORDER BY ID) as rn
-                FROM {LINKS_TO_SCRAP_TABLE}
-                WHERE TOP_LEVEL_SOURCE = :source_url
-            ) 
-            WHERE rn > :offset AND rn <= :end_row
-        """, source_url=source_url, offset=offset, end_row=(offset + page_size))
-        
-        links_data = []
-        
-        for link_row in cursor.fetchall():
-            link, is_processed = link_row
-            
-            # Determine URL status
-            url_status = "Completed" if is_processed == 'true' else "Pending"
-            
-            # If is_processed is "Failed", mark as failed
-            if is_processed == 'Failed':
-                url_status = "Failed"
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                # Calculate pagination parameters
+                offset = (page - 1) * page_size
                 
-            links_data.append({
-                'url': link,
-                'url_status': url_status
-            })
-        
-        # Calculate pagination metadata
-        total_pages = (total_links + page_size - 1) // page_size  # Ceiling division
-        has_next = page < total_pages
-        has_prev = page > 1
-        
+                # Get total count for pagination
+                cursor.execute("""
+                    SELECT COUNT(*) FROM {0}
+                    WHERE TOP_LEVEL_SOURCE = :source_url
+                """.format(LINKS_TO_SCRAP_TABLE), source_url=source_url)
+                
+                total_links = cursor.fetchone()[0]
+                
+                # Fetch the paginated links
+                cursor.execute(f"""
+                    SELECT LINK, IS_PROCESSED 
+                    FROM (
+                        SELECT LINK, IS_PROCESSED, ROW_NUMBER() OVER (ORDER BY ID) as rn
+                        FROM {LINKS_TO_SCRAP_TABLE}
+                        WHERE TOP_LEVEL_SOURCE = :source_url
+                    ) 
+                    WHERE rn > :offset AND rn <= :end_row
+                """, source_url=source_url, offset=offset, end_row=(offset + page_size))
+                
+                links_data = []
+                
+                for link_row in cursor.fetchall():
+                    link, is_processed = link_row
+                    
+                    # Determine URL status
+                    url_status = "Completed" if is_processed == 'true' else "Pending"
+                    
+                    # If is_processed is "Failed", mark as failed
+                    if is_processed == 'Failed':
+                        url_status = "Failed"
+                        
+                    links_data.append({
+                        'url': link,
+                        'url_status': url_status
+                    })
+                
+                # Calculate pagination metadata
+                total_pages = (total_links + page_size - 1) // page_size  # Ceiling division
+                has_next = page < total_pages
+                has_prev = page > 1
+                
         return jsonify({
             'status': 'success',
             'data': links_data,
@@ -2873,492 +3347,194 @@ def scrapped_sub_links():
                 'has_prev': has_prev
             },
             'source_url': source_url,
-            'timestamp': datetime.now().isoformat()  # Fixed datetime usage
+            'timestamp': datetime.now().isoformat()
         })
         
     except Exception as e:
         print(f"Error in scrapped_sub_links: {str(e)}")
         traceback.print_exc()
-        if connection:
-            connection.rollback()
         return jsonify({
             'status': 'error',
             'message': str(e),
             'traceback': traceback.format_exc(),
-            'timestamp': datetime.now().isoformat()  # Fixed datetime usage
+            'timestamp': datetime.now().isoformat()
         }), 500
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
-
-@file_api.route('/get-pending-links', methods=['GET'])
-@token_required
-def get_pending_links(user_id, source_url=None):
-    connection = None
-    cursor = None
-    try:
-        # If source_url parameter was not passed to the function, try to get it from request.args
-        if source_url is None:
-            source_url = request.args.get('source_url')
-        
-        connection = get_oracle_connection()
-        cursor = connection.cursor()
-        
-        query = """
-            SELECT COUNT(*) FROM {0}
-            WHERE (IS_PROCESSED = 'false' OR IS_PROCESSED IS NULL)
-            AND USER_ID = :user_id
-        """.format(LINKS_TO_SCRAP_TABLE)
-        
-        params = {'user_id': user_id}
-        
-        if source_url:
-            query += " AND TOP_LEVEL_SOURCE = :source_url"
-            params['source_url'] = source_url
-            
-        cursor.execute(query, params)
-        pending_count = cursor.fetchone()[0]
-        
-        return jsonify({
-            'status': 'success',
-            'pending_links': pending_count,
-            'source_url': source_url,
-            'timestamp': datetime.now().isoformat()  # Fixed datetime usage
-        })
-    except Exception as e:
-        print(f"Error getting pending links: {str(e)}")
-        traceback.print_exc()
-        if connection:
-            connection.rollback()
-        return standardize_error_response(str(e), 'DB_ERROR', 500)
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
-
-@file_api.route('/get-scrapped-links', methods=['GET'])
-@token_required
-def get_scrapped_links(user_id, source_url=None):
-    connection = None
-    cursor = None
-    try:
-        # If source_url parameter was not passed to the function, try to get it from request.args
-        if source_url is None:
-            source_url = request.args.get('source_url')
-        
-        connection = get_oracle_connection()
-        cursor = connection.cursor()
-        
-        query = """
-            SELECT COUNT(*) FROM {0}
-            WHERE USER_ID = :user_id
-        """.format(SCRAPPED_TEXT_TABLE)
-        
-        params = {'user_id': user_id}
-        
-        if source_url:
-            query += " AND TOP_LEVEL_SOURCE = :source_url"
-            params['source_url'] = source_url
-            
-        cursor.execute(query, params)
-        scraped_count = cursor.fetchone()[0]
-        
-        return jsonify({
-            'status': 'success',
-            'scrapped_links': scraped_count,
-            'source_url': source_url,
-            'timestamp': datetime.now().isoformat()  # Fixed datetime usage
-        })
-    except Exception as e:
-        print(f"Error getting scraped links: {str(e)}")
-        traceback.print_exc()
-        if connection:
-            connection.rollback()
-        return standardize_error_response(str(e), 'DB_ERROR', 500)
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
-
-@file_api.route('/get-total-words-scrapped', methods=['GET'])
-@token_required
-def get_total_words_scrapped(user_id, source_url=None):
-    connection = None
-    cursor = None
-    try:
-        # If source_url parameter was not passed to the function, try to get it from request.args
-        if source_url is None:
-            source_url = request.args.get('source_url')
-        
-        connection = get_oracle_connection()
-        cursor = connection.cursor()
-        
-        # Build the base query
-        query = """
-            SELECT SUM(LENGTH(REGEXP_REPLACE(SCRAPPED_CONTENT, ' +', ' ')) - 
-                   LENGTH(REGEXP_REPLACE(SCRAPPED_CONTENT, ' ', '')) + 1) AS word_count
-            FROM {0}
-            WHERE USER_ID = :user_id
-        """.format(SCRAPPED_TEXT_TABLE)
-        
-        params = {'user_id': user_id}
-        
-        if source_url:
-            query += " AND TOP_LEVEL_SOURCE = :source_url"
-            params['source_url'] = source_url
-            
-        cursor.execute(query, params)
-        row = cursor.fetchone()
-        total_words = row[0] if row and row[0] else 0
-        
-        return jsonify({
-            'status': 'success',
-            'total_words': total_words,
-            'source_url': source_url,
-            'timestamp': datetime.now().isoformat()  # Fixed datetime usage
-        })
-    except Exception as e:
-        print(f"Error getting total words: {str(e)}")
-        traceback.print_exc()
-        if connection:
-            connection.rollback()
-        return standardize_error_response(str(e), 'DB_ERROR', 500)
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
-
-@file_api.route('/get-links-to-scrap', methods=['GET'])
-@token_required
-def get_links_to_scrap(user_id, source_url=None):
-    connection = None
-    cursor = None
-    try:
-        # If source_url parameter was not passed to the function, try to get it from request.args
-        if source_url is None:
-            source_url = request.args.get('source_url')
-        
-        connection = get_oracle_connection()
-        cursor = connection.cursor()
-        
-        query = """
-            SELECT LINK FROM {0}
-            WHERE USER_ID = :user_id
-        """.format(LINKS_TO_SCRAP_TABLE)
-        
-        params = {'user_id': user_id}
-        
-        if source_url:
-            query += " AND TOP_LEVEL_SOURCE = :source_url"
-            params['source_url'] = source_url
-            
-        cursor.execute(query, params)
-        
-        links = [row[0] for row in cursor.fetchall()]
-        
-        return jsonify({
-            'status': 'success',
-            'links': links,
-            'source_url': source_url,
-            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
-        })
-    except Exception as e:
-        print(f"Error getting links to scrap: {str(e)}")
-        traceback.print_exc()
-        if connection:
-            connection.rollback()
-        return standardize_error_response(str(e), 'DB_ERROR', 500)
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
-
-
-@file_api.route('/stop-processing', methods=['POST'])
-@token_required
-def stop_processing_job(user_id):  # Renamed to avoid conflicts
-    """Stop the continuous processing for a specific source URL"""
-    try:
-        print(f"Request to stop processing for user: {user_id}")
-        
-        data = request.get_json()
-        if not data or 'source_url' not in data:
-            print("source_url is missing in request body")
-            return jsonify({
-                'status': 'error',
-                'message': 'source_url is required in the POST body.',
-                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
-            }), 400
-                
-        source_url = data['source_url']
-        print(f"Stopping processing for source URL: {source_url}")
-        
-        # Create user-specific key
-        process_key = f"{user_id}:{source_url}"
-        
-        if process_key in processing_events:
-            print(f"Found processing job for {process_key}, setting stop event")
-            processing_events[process_key].set()
-            
-            # Remove from active jobs list if it exists
-            if user_id in active_user_jobs and source_url in active_user_jobs[user_id]:
-                active_user_jobs[user_id].remove(source_url)
-                if not active_user_jobs[user_id]:
-                    del active_user_jobs[user_id]
-            
-            # Check if there are more URLs in the queue and start the next one
-            start_next = mark_as_complete_and_process_next(user_id, source_url)
-            
-            return jsonify({
-                'status': 'success',
-                'message': f'Processing for {source_url} has been stopped.',
-                'next_started': start_next,
-                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
-            })
-        else:
-            print(f"No active processing found for {process_key}")
-            return jsonify({
-                'status': 'error',
-                'message': f'No active processing found for {source_url}',
-                'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
-            }), 404
-                
-    except Exception as e:
-        print(f"Error stopping processing: {str(e)}")
-        traceback.print_exc()
-        return jsonify({
-            'status': 'error',
-            'message': str(e),
-            'traceback': traceback.format_exc(),
-            'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
-        }), 500
-    
-# @file_api.route('/get-discovered-links', methods=['GET'])
-# @token_required
-# def fetch_discovered_links_v2(user_id, source_url=None):
-#     connection = None
-#     cursor = None
-#     try:
-#         # If source_url parameter was not passed to the function, try to get it from request.args
-#         if source_url is None:
-#             source_url = request.args.get('source_url')
-        
-#         connection = get_oracle_connection()
-#         cursor = connection.cursor()
-        
-#         # Build query with user_id
-#         query = """
-#             SELECT LINK FROM {0}
-#             WHERE USER_ID = :user_id
-#         """.format(LINKS_TO_SCRAP_TABLE)
-        
-#         params = {'user_id': user_id}
-        
-#         if source_url:
-#             query += " AND TOP_LEVEL_SOURCE = :source_url"
-#             params['source_url'] = source_url
-        
-#         # Execute query to get distinct links
-#         cursor.execute(f"""
-#             SELECT DISTINCT LINK FROM ({query})
-#         """, params)
-        
-#         discovered_links = [row[0] for row in cursor.fetchall()]
-        
-#         # Count by domain
-#         domains = {}
-#         for link in discovered_links:
-#             try:
-#                 domain = link.split('//', 1)[1].split('/', 1)[0] if '//' in link else link.split('/', 1)[0]
-#                 domains[domain] = domains.get(domain, 0) + 1
-#             except:
-#                 continue
-        
-#         # Convert to list of dictionaries for response
-#         domain_stats = [{'domain': domain, 'count': count} for domain, count in domains.items()]
-        
-#         return jsonify({
-#             'status': 'success',
-#             'total_links': len(discovered_links),
-#             'domain_stats': domain_stats,
-#             'source_url': source_url,
-#             'timestamp': datetime.datetime.now().isoformat()  # Fixed datetime usage
-#         })
-#     except Exception as e:
-#         print(f"Error getting discovered links: {str(e)}")
-#         traceback.print_exc()
-#         if connection:
-#             connection.rollback()
-#         return standardize_error_response(str(e), 'DB_ERROR', 500)
-#     finally:
-#         if cursor:
-#             cursor.close()
-#         if connection:
-#             connection.close() 
 
 @file_api.route('/all-documents', methods=['GET'])
 @token_required
 def get_all_documents(user_id):
-    connection = None
-    cursor = None
+    """Get all document sources for a user with improved status determination"""
     try:
         print(f"Fetching all documents for user: {user_id}")
-        
-        # Get pagination parameters (optional)
+
+        # Ensure user_id is validated
+        if isinstance(user_id, list):
+            user_id = user_id[0]
+        elif not isinstance(user_id, (int, str)):
+            raise ValueError(f"Invalid user_id type: {type(user_id)}. Expected int or str.")
+
+        # Get pagination parameters
         limit = request.args.get('limit', 100, type=int)
         offset = request.args.get('offset', 0, type=int)
-        
-        connection = get_oracle_connection()
-        cursor = connection.cursor()
-        
-        # Get all source URLs for this user with their timestamps
-        print(f"Querying {SOURCE_URLS_TABLE} for user: {user_id}")
-        cursor.execute(f"""
-            SELECT SOURCE_URL, 
-                   TO_CHAR(TIMESTAMP, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as TIMESTAMP,
-                   PAGE_LIMIT
-            FROM {SOURCE_URLS_TABLE}
-            WHERE USER_ID = :user_id
-            ORDER BY TIMESTAMP DESC
-            OFFSET :offset ROWS FETCH NEXT :limit ROWS ONLY
-        """, user_id=user_id, offset=offset, limit=limit)
-        
-        source_urls = cursor.fetchall()
-        source_url_list = [row[0] for row in source_urls]
-        print(f"Found {len(source_urls)} source URLs for user: {user_id}")
-        
-        if not source_urls:
-            return jsonify({
-                'status': 'success',
-                'documents': [],
-                'count': 0,
-                'timestamp': datetime.now().isoformat()  # Fixed datetime usage
-            })
-        
-        # Query to get all stats in a single operation using CASE statements
-        url_params = {f'url_{i}': url for i, url in enumerate(source_url_list)}
-        
-        # Prepare the parameter placeholders for the IN clause
-        url_placeholders = [f':url_{i}' for i in range(len(source_url_list))]
-        url_in_clause = ', '.join(url_placeholders)
-        
-        # Get all link stats in one query
-        link_stats_query = f"""
-            SELECT 
-                TOP_LEVEL_SOURCE,
-                COUNT(*) as total_links,
-                SUM(CASE WHEN IS_PROCESSED = 'true' THEN 1 ELSE 0 END) as processed_links,
-                SUM(CASE WHEN IS_PROCESSED = 'Failed' THEN 1 ELSE 0 END) as failed_links
-            FROM {LINKS_TO_SCRAP_TABLE}
-            WHERE USER_ID = :user_id
-            AND TOP_LEVEL_SOURCE IN ({url_in_clause})
-            GROUP BY TOP_LEVEL_SOURCE
-        """
-        
-        cursor.execute(link_stats_query, user_id=user_id, **url_params)
-        link_stats = {row[0]: {'total': row[1], 'processed': row[2], 'failed': row[3]} for row in cursor.fetchall()}
-        
-        # Get all scrapped text stats in one query
-        scrapped_query = f"""
-            SELECT 
-                TOP_LEVEL_SOURCE,
-                COUNT(*) as scrapped_count
-            FROM {SCRAPPED_TEXT_TABLE}
-            WHERE USER_ID = :user_id
-            AND TOP_LEVEL_SOURCE IN ({url_in_clause})
-            GROUP BY TOP_LEVEL_SOURCE
-        """
-        
-        cursor.execute(scrapped_query, user_id=user_id, **url_params)
-        scrapped_stats = {row[0]: row[1] for row in cursor.fetchall()}
-        
-        # Get queue information
-        queue_query = f"""
-            SELECT 
-                SOURCE_URL,
-                PROCESSED,
-                PROCESSING_STARTED
-            FROM {PROCESSING_QUEUE_TABLE}
-            WHERE USER_ID = :user_id
-            AND SOURCE_URL IN ({url_in_clause})
-        """
-        
-        cursor.execute(queue_query, user_id=user_id, **url_params)
-        queue_info = {row[0]: {'processed': row[1], 'processing_started': row[2]} for row in cursor.fetchall()}
-        
-        # Construct documents array
-        documents = []
-        for source_url, timestamp, page_limit in source_urls:
-            stats = link_stats.get(source_url, {'total': 0, 'processed': 0, 'failed': 0})
-            total_links = stats['total']
-            processed_count = stats['processed']
-            failed_count = stats['failed']
-            scrapped_count = scrapped_stats.get(source_url, 0)
-            
-            # Calculate progress percentages
-            crawl_progress = 0
-            scrape_progress = 0
-            
-            if total_links > 0:
-                crawl_progress = round((processed_count + failed_count) / total_links * 100, 1)
-                scrape_progress = round(scrapped_count / total_links * 100, 1) if total_links > 0 else 0
-            
-            # Check if URL is in queue
-            in_queue = source_url in queue_info
-            queue_position = None
-            queue_item = queue_info.get(source_url, {})
-            is_processed = queue_item.get('processed', 0) == 1
-            is_processing = queue_item.get('processing_started') is not None
-            
-            # Determine if URL is active job
-            is_active = user_id in active_user_jobs and source_url in active_user_jobs.get(user_id, set())
-            
-            # Determine document status
-            if total_links == 0:
-                status = 'Pending'
-            elif processed_count + failed_count >= total_links:
-                status = 'Completed'
-            elif is_active:
-                status = 'In Progress'
-            elif in_queue and not is_processed and not is_processing:
-                status = 'Queued'
-                # Calculate queue position if needed here
-            else:
-                status = 'Pending'
-            
-            # Create document object
-            document = {
-                'source_url': source_url,
-                'timestamp': timestamp,
-                'page_limit': page_limit,
-                'status': status,
-                'total_links': total_links,
-                'processed_links': processed_count,
-                'failed_links': failed_count,
-                'scrapped_links': scrapped_count,
-                'crawl_progress': crawl_progress,
-                'scrape_progress': scrape_progress,
-                'is_active': is_active,
-                'in_queue': in_queue,
-                'queue_position': queue_position
-            }
-            
-            documents.append(document)
-        
-        # Get the total count for pagination information
-        cursor.execute(f"""
-            SELECT COUNT(*) FROM {SOURCE_URLS_TABLE}
-            WHERE USER_ID = :user_id
-        """, user_id=user_id)
-        
-        total_count = cursor.fetchone()[0]
-        
+
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                # Fetch source URLs
+                print(f"Querying {SOURCE_URLS_TABLE} for user: {user_id}")
+                
+                query = f"""
+                    SELECT SOURCE_URL, 
+                           TO_CHAR(TIMESTAMP, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as TIMESTAMP,
+                           PAGE_LIMIT
+                    FROM {SOURCE_URLS_TABLE}
+                    WHERE USER_ID = :user_id
+                    ORDER BY TIMESTAMP DESC
+                    OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY
+                """
+                cursor.execute(query, {"user_id": user_id})
+                source_urls = cursor.fetchall()
+                
+                print(f"Found {len(source_urls)} source URLs for user: {user_id}")
+
+                if not source_urls:
+                    return jsonify({
+                        'status': 'success',
+                        'documents': [],
+                        'count': 0,
+                        'timestamp': datetime.now().isoformat()
+                    })
+
+                # Extract source URLs for the IN clause
+                source_url_list = [row[0] for row in source_urls]
+                if not source_url_list:
+                    return jsonify({
+                        'status': 'success',
+                        'documents': [],
+                        'count': 0,
+                        'timestamp': datetime.now().isoformat()
+                    })
+
+                # Construct a valid IN clause for Oracle
+                url_in_clause = ", ".join(f"'{url}'" for url in source_url_list)
+
+                # Query for link stats
+                link_stats_query = f"""
+                    SELECT 
+                        TOP_LEVEL_SOURCE,
+                        COUNT(*) as total_links,
+                        SUM(CASE WHEN IS_CRAWLED = 1 THEN 1 ELSE 0 END) as crawled_links,
+                        SUM(CASE WHEN IS_PROCESSED = 'true' THEN 1 ELSE 0 END) as processed_links,
+                        SUM(CASE WHEN IS_PROCESSED = 'Failed' THEN 1 ELSE 0 END) as failed_links
+                    FROM {LINKS_TO_SCRAP_TABLE}
+                    WHERE USER_ID = :user_id
+                    AND TOP_LEVEL_SOURCE IN ({url_in_clause})
+                    GROUP BY TOP_LEVEL_SOURCE
+                """
+                cursor.execute(link_stats_query, {"user_id": user_id})
+                link_stats = {row[0]: {'total': row[1], 'crawled': row[2], 'processed': row[3], 'failed': row[4]} for row in cursor.fetchall()}
+
+                # Query for scrapped text stats
+                scrapped_query = f"""
+                    SELECT 
+                        TOP_LEVEL_SOURCE,
+                        COUNT(*) as scrapped_count
+                    FROM {SCRAPPED_TEXT_TABLE}
+                    WHERE USER_ID = :user_id
+                    AND TOP_LEVEL_SOURCE IN ({url_in_clause})
+                    GROUP BY TOP_LEVEL_SOURCE
+                """
+                cursor.execute(scrapped_query, {"user_id": user_id})
+                scrapped_stats = {row[0]: row[1] for row in cursor.fetchall()}
+
+                # Query for queue information
+                queue_query = f"""
+                    SELECT 
+                        SOURCE_URL,
+                        PROCESSED,
+                        PROCESSING_STARTED
+                    FROM {PROCESSING_QUEUE_TABLE}
+                    WHERE USER_ID = :user_id
+                    AND SOURCE_URL IN ({url_in_clause})
+                """
+                cursor.execute(queue_query, {"user_id": user_id})
+                queue_info = {row[0]: {'processed': row[1], 'processing_started': row[2]} for row in cursor.fetchall()}
+
+                # Construct documents array with more accurate status determination
+                documents = []
+                for source_url, timestamp, page_limit in source_urls:
+                    # Default values if no stats found
+                    total_links = 0
+                    processed_count = 0
+                    failed_count = 0
+                    crawled_count = 0
+                    scrapped_count = 0
+                    
+                    # Get stats if available
+                    if source_url in link_stats:
+                        stats = link_stats[source_url]
+                        total_links = stats['total']
+                        processed_count = stats['processed']
+                        failed_count = stats['failed']
+                        crawled_count = stats['crawled']
+                    
+                    if source_url in scrapped_stats:
+                        scrapped_count = scrapped_stats[source_url]
+
+                    # Calculate progress percentages
+                    crawl_progress = round((crawled_count / total_links * 100), 1) if total_links > 0 else 0
+                    scrape_progress = round((scrapped_count / total_links * 100), 1) if total_links > 0 else 0
+
+                    # Check if URL is in queue
+                    in_queue = source_url in queue_info
+                    queue_item = queue_info.get(source_url, {})
+                    is_processed = queue_item.get('processed', 0) == 1
+                    is_processing = queue_item.get('processing_started') is not None
+
+                    # Determine if URL is active job
+                    is_active = user_id in active_user_jobs and source_url in active_user_jobs.get(user_id, set())
+
+                    # New, more accurate status determination
+                    if total_links == 0:
+                        status = 'Pending'
+                    # Only consider "Completed" if:
+                    # 1. All links have been crawled (crawled_count == total_links)
+                    # 2. All links have been either processed or failed (processed_count + failed_count == total_links)
+                    # 3. We actually have some scraped content (scrapped_count > 0)
+                    elif (crawled_count == total_links and 
+                          processed_count + failed_count == total_links and 
+                          scrapped_count > 0):
+                        status = 'Completed'
+                    elif is_active:
+                        status = 'In Progress'
+                    elif in_queue and not is_processed and not is_processing:
+                        status = 'Queued'
+                    else:
+                        status = 'Processing'
+
+                    # Create document object
+                    document = {
+                        'source_url': source_url,
+                        'timestamp': timestamp,
+                        'page_limit': page_limit,
+                        'status': status,
+                        'total_links': total_links,
+                        'processed_links': processed_count,
+                        'failed_links': failed_count,
+                        'scrapped_links': scrapped_count,
+                        'crawled_links': crawled_count,
+                        'crawl_progress': crawl_progress,
+                        'scrape_progress': scrape_progress,
+                        'is_active': is_active,
+                        'in_queue': in_queue,
+                        'queue_position': None
+                    }
+                    documents.append(document)
+
+                # Get the total count for pagination
+                count_query = f"SELECT COUNT(*) FROM {SOURCE_URLS_TABLE} WHERE USER_ID = :user_id"
+                cursor.execute(count_query, {"user_id": user_id})
+                total_count = cursor.fetchone()[0]
+
         return jsonify({
             'status': 'success',
             'documents': documents,
@@ -3366,21 +3542,220 @@ def get_all_documents(user_id):
             'total': total_count,
             'limit': limit,
             'offset': offset,
-            'timestamp': datetime.now().isoformat()  # Fixed datetime usage
+            'timestamp': datetime.now().isoformat()
         })
-    
+
     except Exception as e:
         print(f"Error getting all documents: {str(e)}")
         traceback.print_exc()
-        if connection:
-            connection.rollback()
         return standardize_error_response(str(e), 'DB_ERROR', 500)
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
+    
+@file_api.route('/get-total-words', methods=['GET'])
+@token_required
+def get_total_words(user_id):
+    """
+    Get the total word count for a source URL or all user content
+    
+    Query parameters:
+    - source_url: (Optional) Filter by parent source URL
+    """
+    try:
+        # Get source_url parameter
+        source_url = request.args.get('source_url')
+        
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                # Build the base query
+                base_query = f"""
+                    SELECT 
+                        COUNT(*) AS total_documents,
+                        SUM(WORD_COUNT) AS total_words,
+                        AVG(WORD_COUNT) AS avg_words_per_document,
+                        MIN(WORD_COUNT) AS min_words,
+                        MAX(WORD_COUNT) AS max_words
+                    FROM {SCRAPPED_TEXT_TABLE}
+                    WHERE USER_ID = :user_id
+                """
+                
+                params = {'user_id': user_id}
+                
+                # Add source_url filter if provided
+                if source_url:
+                    base_query += " AND TOP_LEVEL_SOURCE = :source_url"
+                    params['source_url'] = source_url
+                
+                # Execute the query
+                cursor.execute(base_query, params)
+                
+                result = cursor.fetchone()
+                if not result:
+                    return jsonify({
+                        'status': 'success',
+                        'message': 'No documents found',
+                        'total_documents': 0,
+                        'total_words': 0,
+                        'source_url': source_url if source_url else 'all',
+                        'timestamp': datetime.now().isoformat()
+                    })
+                
+                total_documents, total_words, avg_words, min_words, max_words = result
+                
+                # If source_url is provided, also get document-level word counts
+                document_stats = []
+                if source_url:
+                    document_query = f"""
+                        SELECT 
+                            ID,
+                            CONTENT_LINK,
+                            TITLE,
+                            WORD_COUNT,
+                            TO_CHAR(SCRAPE_DATE, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as SCRAPE_DATE
+                        FROM {SCRAPPED_TEXT_TABLE}
+                        WHERE USER_ID = :user_id AND TOP_LEVEL_SOURCE = :source_url
+                        ORDER BY WORD_COUNT DESC
+                    """
+                    
+                    cursor.execute(document_query, user_id=user_id, source_url=source_url)
+                    
+                    for row in cursor.fetchall():
+                        document_stats.append({
+                            'id': row[0],
+                            'url': row[1],
+                            'title': row[2],
+                            'word_count': row[3],
+                            'scrape_date': row[4]
+                        })
+                
+                return jsonify({
+                    'status': 'success',
+                    'total_documents': total_documents,
+                    'total_words': total_words,
+                    'average_words_per_document': round(avg_words, 1) if avg_words else 0,
+                    'min_words': min_words,
+                    'max_words': max_words,
+                    'document_details': document_stats if source_url else [],
+                    'source_url': source_url if source_url else 'all',
+                    'timestamp': datetime.now().isoformat()
+                })
+                
+    except Exception as e:
+        print(f"Error getting total words: {str(e)}")
+        traceback.print_exc()
+        return standardize_error_response(str(e), 'SERVER_ERROR', 500)  
+      
+@file_api.route('/vectorization-status', methods=['GET'])
+@token_required
+def get_vectorization_status(user_id):
+    """Get the vectorization status for a source URL"""
+    try:
+        source_url = request.args.get('source_url')
+        
+        if not source_url:
+            return standardize_error_response('source_url parameter is required.', 'MISSING_PARAM', 400)
+        
+        # Connect to vector database to check if vectors exist
+        from oracle_chatbot import connect_to_vectdb
+        from langchain_google_genai import GoogleGenerativeAIEmbeddings
+        from langchain_community.vectorstores import OracleVS
+        from langchain_community.vectorstores.utils import DistanceStrategy
+        import os
+        
+        # Get the VECTDB_TABLE_NAME and GOOGLE_API_KEY
+        VECTDB_TABLE_NAME = os.getenv("VECTDB_TABLE_NAME", "vector_files_with_10000_chunk_new")
+        GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+        
+        vectdb_connection = connect_to_vectdb()
+        if not vectdb_connection:
+            return standardize_error_response('Failed to connect to vector database', 'DB_ERROR', 500)
+        
+        try:
+            # Initialize embeddings and vector store
+            embeddings = GoogleGenerativeAIEmbeddings(
+                google_api_key=GOOGLE_API_KEY,
+                model="models/text-embedding-004"
+            )
             
+            vector_store = OracleVS(
+                client=vectdb_connection,
+                embedding_function=embeddings,
+                table_name=VECTDB_TABLE_NAME,
+                distance_strategy=DistanceStrategy.COSINE,
+            )
+            
+            # Use a query to check if any vectors exist for this source_url
+            # We'll use an SQL query directly on the vector table
+            with vectdb_connection.cursor() as cursor:
+                # Check the vector store metadata to see if any entries are for this source_url
+                cursor.execute("""
+                    SELECT COUNT(*) FROM {0}
+                    WHERE METADATA LIKE :source_pattern
+                """.format(VECTDB_TABLE_NAME), 
+                   source_pattern=f'%"source":"{source_url}"%')
+                
+                vector_count = cursor.fetchone()[0]
+                
+                # Get the total documents scraped for this source URL
+                with get_db_connection() as text_conn:
+                    with text_conn.cursor() as text_cursor:
+                        text_cursor.execute("""
+                            SELECT COUNT(*) FROM {0}
+                            WHERE TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
+                        """.format(SCRAPPED_TEXT_TABLE), 
+                           source_url=source_url, user_id=user_id)
+                        
+                        document_count = text_cursor.fetchone()[0]
+                
+                # Determine status
+                if vector_count > 0:
+                    status = "Vectorized"
+                    message = f"Source URL has been vectorized with {vector_count} vector entries from {document_count} documents."
+                elif document_count == 0:
+                    status = "No Data"
+                    message = "No scrapped documents found for this source URL."
+                else:
+                    status = "Pending"
+                    message = f"Source URL has {document_count} documents that need to be vectorized."
+                
+                # Get processing status as well
+                with get_db_connection() as processing_conn:
+                    with processing_conn.cursor() as processing_cursor:
+                        processing_cursor.execute("""
+                            SELECT PROCESSED, PROCESSING_COMPLETED 
+                            FROM {0}
+                            WHERE SOURCE_URL = :source_url AND USER_ID = :user_id
+                        """.format(PROCESSING_QUEUE_TABLE), 
+                           source_url=source_url, user_id=user_id)
+                        
+                        processing_row = processing_cursor.fetchone()
+                        crawling_complete = False
+                        
+                        if processing_row and processing_row[0] == 1:
+                            crawling_complete = True
+                
+                # Final status
+                is_ready_for_chatbot = status == "Vectorized" and crawling_complete
+                
+                return jsonify({
+                    'status': 'success',
+                    'vectorization_status': status,
+                    'message': message,
+                    'vector_count': vector_count,
+                    'document_count': document_count,
+                    'crawling_complete': crawling_complete,
+                    'ready_for_chatbot': is_ready_for_chatbot,
+                    'source_url': source_url,
+                    'timestamp': datetime.now().isoformat()
+                })
+                
+        finally:
+            if vectdb_connection:
+                vectdb_connection.close()
+    
+    except Exception as e:
+        traceback_str = traceback.format_exc()
+        print(f"Error checking vectorization status: {str(e)}\n{traceback_str}")
+        return standardize_error_response(str(e), 'SERVER_ERROR', 500)
+    
 def standardize_error_response(error, code=None, status_code=500):
     """
     Create a standardized error response
@@ -3403,7 +3778,7 @@ def standardize_error_response(error, code=None, status_code=500):
     response = {
         'status': 'error',
         'message': error_message,
-        'timestamp': datetime.now().isoformat()  # Fixed datetime usage
+        'timestamp': datetime.now().isoformat()
     }
     
     if code:
@@ -3414,18 +3789,5 @@ def standardize_error_response(error, code=None, status_code=500):
         print(f"Server error: {error_message}\n{traceback_str}")
         response['error_details'] = traceback_str
         
-    return jsonify(response), status_code
-
-    
-# Example usage in an endpoint:
-# try:
-#     # Some operation
-#     pass
-# except oracledb.DatabaseError as e:
-#     error, = e.args
-#     if error.code == 1:  # Specific Oracle error code
-#         return standardize_error_response("Database constraint violation", "DB_CONSTRAINT", 400)
-#     else:
-#         return standardize_error_response(e, "DB_ERROR", 500)
-# except Exception as e:
-#     return standardize_error_response(e, "SERVER_ERROR", 500)
+    return jsonify(response), status_code            
+                

@@ -314,22 +314,136 @@ async def create_new_session(db_conn, title="New Conversation"):
             cursor.close()
 
 async def get_session(db_conn, session_id):
+    """
+    Get a specific chat session by its ID with improved error handling
+    
+    Args:
+        db_conn: Oracle database connection
+        session_id: The ID of the session to retrieve
+        
+    Returns:
+        dict: The session data or None if not found
+    """
     cursor = None
     try:
         cursor = db_conn.cursor()
-        select_query = """
-        SELECT JSON_DATA
-        FROM CHAT_SESSIONS
-        WHERE JSON_VALUE(JSON_DATA, '$.session_id') = :1
-        """
-        cursor.execute(select_query, [session_id])
-        result = cursor.fetchone()
+        print(f"Retrieving session with ID: {session_id}")
         
-        if result and result[0]:
-            return json.loads(result[0]) if isinstance(result[0], str) else result[0]
-        return None
+        # Try the standard query first
+        try:
+            select_query = """
+            SELECT JSON_DATA
+            FROM CHAT_SESSIONS
+            WHERE JSON_VALUE(JSON_DATA, '$.session_id') = :session_id
+            """
+            cursor.execute(select_query, session_id=session_id)  # Use named parameter
+            result = cursor.fetchone()
+            
+            if result:
+                print(f"Found session {session_id} using JSON_VALUE")
+                data = result[0]
+                
+                # Handle different data types
+                if isinstance(data, oracledb.LOB):
+                    data = data.read()
+                    
+                if isinstance(data, str):
+                    return json.loads(data)
+                elif isinstance(data, bytes):
+                    return json.loads(data.decode('utf-8'))
+                else:
+                    return data
+            else:
+                print(f"Session {session_id} not found with JSON_VALUE query")
+                
+                # Try a more direct approach with LIKE query as fallback
+                print("Trying fallback query with LIKE...")
+                fallback_query = """
+                SELECT JSON_DATA
+                FROM CHAT_SESSIONS
+                WHERE JSON_DATA LIKE '%"session_id":"' || :session_id || '"%'
+                   OR JSON_DATA LIKE '%"session_id": "' || :session_id || '"%'
+                """
+                cursor.execute(fallback_query, session_id=session_id)  # Use named parameter
+                fallback_result = cursor.fetchone()
+                
+                if fallback_result:
+                    print(f"Found session {session_id} using LIKE query")
+                    data = fallback_result[0]
+                    
+                    # Handle different data types
+                    if isinstance(data, oracledb.LOB):
+                        data = data.read()
+                        
+                    if isinstance(data, str):
+                        return json.loads(data)
+                    elif isinstance(data, bytes):
+                        return json.loads(data.decode('utf-8'))
+                    else:
+                        return data
+                    
+                # Last resort: scan all rows
+                print("Trying last resort - scanning all sessions...")
+                cursor.execute("SELECT JSON_DATA FROM CHAT_SESSIONS")
+                all_rows = cursor.fetchall()
+                print(f"Scanning {len(all_rows)} rows to find session {session_id}")
+                
+                for row in all_rows:
+                    try:
+                        data = row[0]
+                        if isinstance(data, oracledb.LOB):
+                            data = data.read()
+                            
+                        if isinstance(data, str):
+                            parsed = json.loads(data)
+                        elif isinstance(data, bytes):
+                            parsed = json.loads(data.decode('utf-8'))
+                        else:
+                            parsed = data
+                            
+                        if parsed.get('session_id') == session_id:
+                            print(f"Found session {session_id} by scanning all rows")
+                            return parsed
+                    except Exception as row_error:
+                        print(f"Error processing row during scan: {str(row_error)}")
+                        continue
+                
+                print(f"Session {session_id} not found after trying all methods")
+                return None
+                
+        except Exception as query_error:
+            print(f"Error in main query: {str(query_error)}")
+            traceback.print_exc()
+            
+            # Try a simplified query if JSON_VALUE fails
+            try:
+                cursor.execute("SELECT JSON_DATA FROM CHAT_SESSIONS")
+                all_rows = cursor.fetchall()
+                
+                for row in all_rows:
+                    try:
+                        data = row[0]
+                        if isinstance(data, oracledb.LOB):
+                            data = data.read()
+                            
+                        if isinstance(data, str):
+                            parsed = json.loads(data)
+                        elif isinstance(data, bytes):
+                            parsed = json.loads(data.decode('utf-8'))
+                        else:
+                            parsed = data
+                            
+                        if parsed.get('session_id') == session_id:
+                            return parsed
+                    except:
+                        continue
+                        
+                return None
+            except Exception as fallback_error:
+                print(f"Fallback query also failed: {str(fallback_error)}")
+                return None
     except Exception as e:
-        print("Error fetching session:", e)
+        print(f"Unexpected error in get_session: {str(e)}")
         traceback.print_exc()
         return None
     finally:
@@ -337,12 +451,41 @@ async def get_session(db_conn, session_id):
             cursor.close()
 
 async def update_session(db_conn, session_id, user_message, assistant_response):
+    """
+    Update a chat session with new messages with improved error handling and verification
+    
+    Args:
+        db_conn: Oracle database connection
+        session_id: The ID of the session to update
+        user_message: The user's message to add
+        assistant_response: The assistant's response to add
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
     cursor = None
     try:
+        print(f"Updating session {session_id} with new messages")
+        
         # Get the current session
         session = await get_session(db_conn, session_id)
         if not session:
-            raise Exception(f"Session not found: {session_id}")
+            print(f"Session {session_id} not found, creating a new session")
+            # Create a new session since the specified one doesn't exist
+            new_session_id = str(int(time.time()))
+            new_session = ChatSession(session_id=new_session_id, title="New Conversation")
+            session = new_session.to_dict()
+            session_id = new_session_id
+            
+            # Insert the new session
+            cursor = db_conn.cursor()
+            insert_query = """
+            INSERT INTO CHAT_SESSIONS (JSON_DATA)
+            VALUES (:1)
+            """
+            cursor.execute(insert_query, (json.dumps(session),))
+            db_conn.commit()
+            print(f"Created new session {session_id} as fallback")
         
         # Create message objects
         message_user = {
@@ -361,26 +504,103 @@ async def update_session(db_conn, session_id, user_message, assistant_response):
         current_messages = session.get("messages", [])
         updated_messages = current_messages + [message_user, message_assistant]
         
-        # Update the session
+        # Update timestamp
+        last_updated = datetime.utcnow().isoformat()
+        
+        # Try first with JSON_MERGEPATCH
         cursor = db_conn.cursor()
-        update_query = """
-        UPDATE CHAT_SESSIONS
-        SET JSON_DATA = JSON_MERGEPATCH(JSON_DATA, :1)
-        WHERE JSON_VALUE(JSON_DATA, '$.session_id') = :2
-        """
-        
-        patch_data = json.dumps({
-            "messages": updated_messages,
-            "last_updated": datetime.utcnow().isoformat()
-        })
-        
-        cursor.execute(update_query, [patch_data, session_id])
-        db_conn.commit()
-        
-        return True
+        try:
+            update_query = """
+            UPDATE CHAT_SESSIONS
+            SET JSON_DATA = JSON_MERGEPATCH(JSON_DATA, :1)
+            WHERE JSON_VALUE(JSON_DATA, '$.session_id') = :2
+            """
+            
+            patch_data = json.dumps({
+                "messages": updated_messages,
+                "last_updated": last_updated
+            })
+            
+            cursor.execute(update_query, [patch_data, session_id])
+            rows_updated = cursor.rowcount
+            
+            if rows_updated > 0:
+                db_conn.commit()
+                print(f"Updated session {session_id} using JSON_MERGEPATCH, {rows_updated} rows affected")
+                
+                # Verify the update
+                updated_session = await get_session(db_conn, session_id)
+                if updated_session and len(updated_session.get('messages', [])) == len(updated_messages):
+                    print(f"Verified update success: session now has {len(updated_messages)} messages")
+                    return True
+                else:
+                    print("WARNING: Session update verification failed")
+            else:
+                print(f"No rows updated with JSON_MERGEPATCH, trying alternative approach")
+                
+                # Try alternative approach by replacing the entire document
+                try:
+                    # Update the session object and replace it entirely
+                    session['messages'] = updated_messages
+                    session['last_updated'] = last_updated
+                    
+                    # Find the row by ID using a LIKE clause as fallback
+                    select_id_query = """
+                    SELECT ID FROM CHAT_SESSIONS
+                    WHERE JSON_DATA LIKE '%"session_id":"' || :1 || '"%'
+                       OR JSON_DATA LIKE '%"session_id": "' || :1 || '"%'
+                    """
+                    cursor.execute(select_id_query, [session_id])
+                    id_result = cursor.fetchone()
+                    
+                    if id_result:
+                        row_id = id_result[0]
+                        
+                        # Update by ID (more reliable)
+                        update_by_id_query = """
+                        UPDATE CHAT_SESSIONS
+                        SET JSON_DATA = :1
+                        WHERE ID = :2
+                        """
+                        cursor.execute(update_by_id_query, [json.dumps(session), row_id])
+                        rows_updated = cursor.rowcount
+                        
+                        if rows_updated > 0:
+                            db_conn.commit()
+                            print(f"Updated session {session_id} by replacing document, {rows_updated} rows affected")
+                            return True
+                        else:
+                            print(f"Failed to update session {session_id} by ID")
+                    else:
+                        print(f"Couldn't find row ID for session {session_id}, attempting insert as new session")
+                        
+                        # Last resort: Insert as new session with same session_id
+                        insert_query = """
+                        INSERT INTO CHAT_SESSIONS (JSON_DATA)
+                        VALUES (:1)
+                        """
+                        cursor.execute(insert_query, [json.dumps(session)])
+                        db_conn.commit()
+                        print(f"Inserted session {session_id} as new document")
+                        return True
+                except Exception as alt_error:
+                    print(f"Alternative update approach failed: {str(alt_error)}")
+                    traceback.print_exc()
+                    
+                    if db_conn:
+                        db_conn.rollback()
+                    return False
+        except Exception as update_error:
+            print(f"Error updating session: {str(update_error)}")
+            traceback.print_exc()
+            
+            if db_conn:
+                db_conn.rollback()
+            return False
     except Exception as e:
-        print(f"Error updating session: {e}")
+        print(f"Unexpected error in update_session: {str(e)}")
         traceback.print_exc()
+        
         if db_conn:
             db_conn.rollback()
         return False
@@ -418,36 +638,141 @@ async def update_session_title(db_conn, session_id, new_title):
             cursor.close()
 
 async def get_all_conversations(db_conn):
+    """
+    Get all chat conversations with improved error handling and debugging
+    
+    Args:
+        db_conn: Oracle database connection
+        
+    Returns:
+        list: List of conversation summary objects
+    """
     cursor = None
     try:
         cursor = db_conn.cursor()
+        
+        # First check if the table exists and has data
         cursor.execute("""
-        SELECT JSON_DATA 
-        FROM CHAT_SESSIONS
-        ORDER BY JSON_VALUE(JSON_DATA, '$.last_updated') DESC
+        SELECT COUNT(*) 
+        FROM USER_TABLES 
+        WHERE TABLE_NAME = 'CHAT_SESSIONS'
         """)
+        table_exists = cursor.fetchone()[0] > 0
         
-        rows = cursor.fetchall()
-        conversations = []
-        
-        for row in rows:
-            session_data = row[0]
-            if isinstance(session_data, str):
-                session_data = json.loads(session_data)
-                
-            messages = session_data.get("messages", [])
-            last_message = messages[-1]["content"] if messages else ""
+        if not table_exists:
+            print("CHAT_SESSIONS table doesn't exist in the current schema")
+            return []
             
-            conversations.append({
-                "session_id": session_data.get("session_id", "Unknown"),
-                "title": session_data.get("title", "Untitled"),
-                "last_message": last_message,
-                "last_updated": session_data.get("last_updated", "Unknown")
-            })
+        # Check if there are any rows in the table
+        cursor.execute("SELECT COUNT(*) FROM CHAT_SESSIONS")
+        row_count = cursor.fetchone()[0]
+        print(f"Found {row_count} rows in CHAT_SESSIONS table")
         
-        return conversations
+        if row_count == 0:
+            print("CHAT_SESSIONS table exists but is empty")
+            return []
+            
+        # Try to retrieve all conversations with a more robust query
+        # that doesn't rely on JSON_VALUE for sorting
+        try:
+            cursor.execute("""
+            SELECT JSON_DATA 
+            FROM CHAT_SESSIONS
+            ORDER BY CREATED_AT DESC
+            """)
+            
+            print(f"Query executed, retrieving conversations...")
+            rows = cursor.fetchall()
+            print(f"Fetched {len(rows)} rows from database")
+            
+            conversations = []
+            error_count = 0
+            
+            for idx, row in enumerate(rows):
+                try:
+                    session_data = row[0]
+                    
+                    # Handle different types of data returned by Oracle
+                    if isinstance(session_data, oracledb.LOB):
+                        session_data = session_data.read()
+                        
+                    if isinstance(session_data, str):
+                        session_data = json.loads(session_data)
+                    elif isinstance(session_data, bytes):
+                        session_data = json.loads(session_data.decode('utf-8'))
+                    
+                    # Extract session ID and title with fallbacks
+                    session_id = session_data.get("session_id", f"unknown-{idx}")
+                    title = session_data.get("title", "Untitled Conversation")
+                    
+                    # Extract messages safely
+                    messages = session_data.get("messages", [])
+                    last_message = ""
+                    if messages and len(messages) > 0:
+                        # Get the last message, preferring assistant's message
+                        for msg in reversed(messages):
+                            if isinstance(msg, dict) and 'content' in msg:
+                                last_message = msg.get('content', '')[:50] + "..."  # Truncate for summary
+                                break
+                    
+                    # Get the last_updated time
+                    last_updated = session_data.get("last_updated", 
+                                    session_data.get("created_at", "Unknown"))
+                    
+                    conversations.append({
+                        "session_id": session_id,
+                        "title": title,
+                        "last_message": last_message,
+                        "last_updated": last_updated,
+                        "message_count": len(messages)
+                    })
+                    
+                except Exception as row_error:
+                    error_count += 1
+                    print(f"Error processing row {idx}: {str(row_error)}")
+                    # Continue to next row instead of failing completely
+            
+            if error_count > 0:
+                print(f"Encountered errors processing {error_count} out of {len(rows)} rows")
+            
+            return conversations
+            
+        except Exception as query_error:
+            print(f"Error executing main query: {str(query_error)}")
+            traceback.print_exc()
+            
+            # Fallback to basic query without JSON functions or sorting
+            print("Trying fallback query...")
+            cursor.execute("SELECT JSON_DATA FROM CHAT_SESSIONS")
+            rows = cursor.fetchall()
+            
+            print(f"Fallback query retrieved {len(rows)} rows")
+            conversations = []
+            
+            for idx, row in enumerate(rows):
+                try:
+                    # Handle data carefully with minimal assumptions
+                    data = row[0]
+                    if isinstance(data, oracledb.LOB):
+                        data = data.read()
+                    
+                    if isinstance(data, str):
+                        try:
+                            parsed = json.loads(data)
+                            conversations.append({
+                                "session_id": parsed.get("session_id", f"unknown-{idx}"),
+                                "title": parsed.get("title", "Untitled"),
+                                "last_message": "Message retrieval not available in fallback mode",
+                                "last_updated": "Unknown"
+                            })
+                        except json.JSONDecodeError:
+                            print(f"Row {idx} contains invalid JSON")
+                except Exception as row_error:
+                    print(f"Error processing fallback row {idx}: {str(row_error)}")
+            
+            return conversations
     except Exception as e:
-        print(f"Error getting conversations: {e}")
+        print(f"Unexpected error in get_all_conversations: {str(e)}")
         traceback.print_exc()
         return []
     finally:

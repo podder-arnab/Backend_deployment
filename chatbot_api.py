@@ -47,9 +47,9 @@ else:
 
 @chatbot_api.route('/chat', methods=['POST'])
 @api_key_required
-def chat():  # Remove async keyword
+def chat():
     """
-    Process a chat message and get a response
+    Process a chat message and get a response with improved error handling and debugging
     
     Request body:
     - message: The user message
@@ -62,7 +62,7 @@ def chat():  # Remove async keyword
         message = data.get('message')
         session_id = data.get('session_id')
         api_key = data.get('api_key')
-        source_level_url = data.get('source_level_url')  # New parameter
+        source_level_url = data.get('source_level_url')
         
         if not message:
             return jsonify({
@@ -72,7 +72,7 @@ def chat():  # Remove async keyword
             }), 400
         
         # Log the request with source_level_url for debugging
-        print(f"Chat request: message='{message}', source_level_url='{source_level_url}', session_id='{session_id}'")
+        print(f"Chat request: message='{message[:30]}...', source_level_url='{source_level_url}', session_id='{session_id}'")
         
         # Create a new database connection for this request
         db_conn = connect_to_jsondb()
@@ -85,9 +85,25 @@ def chat():  # Remove async keyword
         
         try:
             # Process the chat request with the source_level_url
-            # For async functions, we can use asyncio.run() to run them synchronously
             import asyncio
+            
+            # Add debug to check existing session if session_id provided
+            if session_id:
+                session_check = asyncio.run(get_session(db_conn, session_id))
+                if session_check:
+                    print(f"Found existing session {session_id} with {len(session_check.get('messages', []))} messages")
+                else:
+                    print(f"Session {session_id} not found, will create new session")
+            
             response = asyncio.run(process_chat_request(db_conn, message, session_id, api_key, source_level_url))
+            
+            # Verify session was saved after processing
+            if response.session_id:
+                saved_session = asyncio.run(get_session(db_conn, response.session_id))
+                if saved_session:
+                    print(f"Verified session {response.session_id} was saved with {len(saved_session.get('messages', []))} messages")
+                else:
+                    print(f"WARNING: Could not verify session {response.session_id} was saved!")
             
             # Prepare the response
             result = {
@@ -170,9 +186,9 @@ def vectorize_scrapped_text():  # Remove async keyword
 
 @chatbot_api.route('/conversations', methods=['GET'])
 @api_key_required
-def get_conversations():  # Remove async keyword
+def get_conversations():
     """
-    Get all chat conversations
+    Get all chat conversations with improved debugging
     
     Query parameters:
     - api_key: API key for authentication
@@ -188,13 +204,30 @@ def get_conversations():  # Remove async keyword
             }), 500
         
         try:
-            # Get all conversations - use asyncio.run for async function
+            # Check table existence and data
+            cursor = db_conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM CHAT_SESSIONS")
+            count = cursor.fetchone()[0]
+            print(f"CHAT_SESSIONS table contains {count} rows")
+            cursor.close()
+            
+            # Get all conversations with improved function
             import asyncio
             conversations = asyncio.run(get_all_conversations(db_conn))
+            
+            print(f"Retrieved {len(conversations)} conversations")
+            
+            # Include debug info in the response during testing
+            debug_info = {
+                'db_connection': 'successful',
+                'row_count': count,
+                'conversations_retrieved': len(conversations)
+            }
             
             return jsonify({
                 'status': 'success',
                 'conversations': conversations,
+                'debug': debug_info,
                 'timestamp': datetime.now().isoformat()
             })
         finally:
@@ -209,11 +242,12 @@ def get_conversations():  # Remove async keyword
             'timestamp': datetime.now().isoformat()
         }), 500
 
+
 @chatbot_api.route('/conversation/<session_id>', methods=['GET'])
 @api_key_required
-def get_conversation(session_id):  # Remove async keyword
+def get_conversation(session_id):
     """
-    Get a specific chat conversation
+    Get a specific chat conversation with improved error handling
     
     Path parameters:
     - session_id: The session ID
@@ -222,6 +256,8 @@ def get_conversation(session_id):  # Remove async keyword
     - api_key: API key for authentication
     """
     try:
+        print(f"Getting conversation for session ID: {session_id}")
+        
         # Create a new database connection for this request
         db_conn = connect_to_jsondb()
         if not db_conn:
@@ -232,7 +268,18 @@ def get_conversation(session_id):  # Remove async keyword
             }), 500
         
         try:
-            # Get the conversation - use asyncio.run for async function
+            # Check if session exists - FIXED: Use named parameters instead of positional
+            cursor = db_conn.cursor()
+            cursor.execute("""
+                SELECT COUNT(*) FROM CHAT_SESSIONS
+                WHERE JSON_DATA LIKE '%"session_id":"' || :session_id || '"%'
+                   OR JSON_DATA LIKE '%"session_id": "' || :session_id || '"%'
+            """, session_id=session_id)  # Use named parameter instead of list
+            session_count = cursor.fetchone()[0]
+            print(f"Found {session_count} sessions matching ID {session_id}")
+            cursor.close()
+            
+            # Get the conversation with improved function
             import asyncio
             session = asyncio.run(get_session(db_conn, session_id))
             
@@ -240,12 +287,21 @@ def get_conversation(session_id):  # Remove async keyword
                 return jsonify({
                     'status': 'error',
                     'message': 'Conversation not found',
+                    'debug': {'session_count': session_count},
                     'timestamp': datetime.now().isoformat()
                 }), 404
+            
+            # For debugging, count messages
+            message_count = len(session.get('messages', []))
+            print(f"Retrieved session with {message_count} messages")
             
             return jsonify({
                 'status': 'success',
                 'session': session,
+                'debug': {
+                    'message_count': message_count,
+                    'session_count': session_count
+                },
                 'timestamp': datetime.now().isoformat()
             })
         finally:
