@@ -112,11 +112,11 @@ def get_db_connection():
 
 
 def initialize_tables():
-    """Initialize all necessary tables if they don't exist with optimized indexes"""
+    """Initialize all necessary tables if they don't exist with optimized indexes and AUTO_VECTORIZE column"""
     try:
         with get_db_connection() as connection:
             with connection.cursor() as cursor:
-                # Map of table names to their creation SQL (unchanged)
+                # Map of table names to their creation SQL (updated to include AUTO_VECTORIZE)
                 tables = {
                     CONTENT_LINKS_TABLE: """
                         CREATE TABLE {0} (
@@ -182,6 +182,7 @@ def initialize_tables():
                             PROCESSING_STARTED TIMESTAMP,
                             PROCESSING_COMPLETED TIMESTAMP,
                             PAGE_LIMIT NUMBER DEFAULT 10,
+                            AUTO_VECTORIZE NUMBER(1) DEFAULT 1,
                             CONSTRAINT UQ_USER_SOURCE UNIQUE (USER_ID, SOURCE_URL)
                         )
                     """,
@@ -192,7 +193,8 @@ def initialize_tables():
                             SOURCE_URL VARCHAR2(2000) NOT NULL,
                             USER_ID VARCHAR2(50),
                             TIMESTAMP TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            PAGE_LIMIT NUMBER DEFAULT 10
+                            PAGE_LIMIT NUMBER DEFAULT 10,
+                            AUTO_VECTORIZE NUMBER(1) DEFAULT 1
                         )
                     """,
                     PROGRESS_HISTORY_TABLE: """
@@ -287,12 +289,88 @@ def initialize_tables():
                                 """)
                                 
                                 print(f"Added WORD_COUNT column to existing SCRAPPED_TEXT table")
+                        
+                        # Check for AUTO_VECTORIZE column in PROCESSING_QUEUE_TABLE
+                        if table_name == PROCESSING_QUEUE_TABLE:
+                            cursor.execute("""
+                                SELECT COUNT(*) FROM USER_TAB_COLUMNS 
+                                WHERE TABLE_NAME = 'PROCESSING_QUEUE' AND COLUMN_NAME = 'AUTO_VECTORIZE'
+                            """)
+                            
+                            column_exists = cursor.fetchone()[0] > 0
+                            
+                            if not column_exists:
+                                # Add the AUTO_VECTORIZE column to an existing table
+                                cursor.execute("""
+                                    ALTER TABLE PROCESSING_QUEUE 
+                                    ADD AUTO_VECTORIZE NUMBER(1) DEFAULT 1
+                                """)
+                                
+                                print(f"Added AUTO_VECTORIZE column to existing PROCESSING_QUEUE table")
+                        
+                        # Check for AUTO_VECTORIZE column in SOURCE_URLS_TABLE
+                        if table_name == SOURCE_URLS_TABLE:
+                            cursor.execute("""
+                                SELECT COUNT(*) FROM USER_TAB_COLUMNS 
+                                WHERE TABLE_NAME = 'SOURCE_URLS' AND COLUMN_NAME = 'AUTO_VECTORIZE'
+                            """)
+                            
+                            column_exists = cursor.fetchone()[0] > 0
+                            
+                            if not column_exists:
+                                # Add the AUTO_VECTORIZE column to an existing table
+                                cursor.execute("""
+                                    ALTER TABLE SOURCE_URLS 
+                                    ADD AUTO_VECTORIZE NUMBER(1) DEFAULT 1
+                                """)
+                                
+                                print(f"Added AUTO_VECTORIZE column to existing SOURCE_URLS table")
                 
                 connection.commit()
                 print("Database tables initialized successfully")
     except Exception as e:
         print(f"Error initializing tables: {e}")
         traceback.print_exc()
+
+def update_database_structure():
+    """Add the AUTO_VECTORIZE column to tables if it doesn't exist"""
+    try:
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                # Check and update the PROCESSING_QUEUE_TABLE
+                cursor.execute("""
+                    SELECT COUNT(*) FROM USER_TAB_COLUMNS 
+                    WHERE TABLE_NAME = :table_name AND COLUMN_NAME = 'AUTO_VECTORIZE'
+                """, table_name=PROCESSING_QUEUE_TABLE)
+                
+                if cursor.fetchone()[0] == 0:
+                    # Add the AUTO_VECTORIZE column
+                    cursor.execute(f"""
+                        ALTER TABLE {PROCESSING_QUEUE_TABLE} 
+                        ADD AUTO_VECTORIZE NUMBER(1) DEFAULT 1
+                    """)
+                    print(f"Added AUTO_VECTORIZE column to {PROCESSING_QUEUE_TABLE}")
+                
+                # Check and update the SOURCE_URLS_TABLE
+                cursor.execute("""
+                    SELECT COUNT(*) FROM USER_TAB_COLUMNS 
+                    WHERE TABLE_NAME = :table_name AND COLUMN_NAME = 'AUTO_VECTORIZE'
+                """, table_name=SOURCE_URLS_TABLE)
+                
+                if cursor.fetchone()[0] == 0:
+                    # Add the AUTO_VECTORIZE column
+                    cursor.execute(f"""
+                        ALTER TABLE {SOURCE_URLS_TABLE} 
+                        ADD AUTO_VECTORIZE NUMBER(1) DEFAULT 1
+                    """)
+                    print(f"Added AUTO_VECTORIZE column to {SOURCE_URLS_TABLE}")
+                
+                connection.commit()
+                return True
+    except Exception as e:
+        print(f"Error updating database structure: {str(e)}")
+        traceback.print_exc()
+        return False
 
 # Initialize tables on module load
 initialize_tables()
@@ -935,11 +1013,14 @@ def add_to_queue(user_id, source_url, additional_data=None):
                     
                 # Set defaults
                 page_limit = 10
+                auto_vectorize = True
                 
                 # Update with any additional data
                 if additional_data:
                     if 'page_limit' in additional_data:
                         page_limit = additional_data['page_limit']
+                    if 'auto_vectorize' in additional_data:
+                        auto_vectorize = additional_data['auto_vectorize']
                 
                 # Insert queue item with retry logic
                 retry_count = 0
@@ -948,13 +1029,21 @@ def add_to_queue(user_id, source_url, additional_data=None):
                 while retry_count < max_retries:
                     try:
                         cursor.execute("""
-                            INSERT INTO {0} (USER_ID, SOURCE_URL, ADDED_AT, PROCESSED, PAGE_LIMIT)
-                            VALUES (:user_id, :source_url, CURRENT_TIMESTAMP, 0, :page_limit)
+                            INSERT INTO {0} (
+                                USER_ID, SOURCE_URL, ADDED_AT, PROCESSED, 
+                                PAGE_LIMIT, AUTO_VECTORIZE
+                            ) VALUES (
+                                :user_id, :source_url, CURRENT_TIMESTAMP, 0, 
+                                :page_limit, :auto_vectorize
+                            )
                         """.format(PROCESSING_QUEUE_TABLE),
-                           user_id=user_id, source_url=source_url, page_limit=page_limit)
+                           user_id=user_id, 
+                           source_url=source_url, 
+                           page_limit=page_limit,
+                           auto_vectorize=1 if auto_vectorize else 0)
                         
                         connection.commit()
-                        print(f"Added URL to queue: {source_url} for user {user_id}, page_limit: {page_limit}")
+                        print(f"Added URL to queue: {source_url} for user {user_id}, page_limit: {page_limit}, auto_vectorize: {auto_vectorize}")
                         return True
                     except oracledb.DatabaseError as db_error:
                         error, = db_error.args
@@ -1297,10 +1386,16 @@ def continuous_crawl_job(top_level_source_url, stop_event, user_id=None, page_li
             'traceback': traceback.format_exc()
         }
 
-def start_crawling_and_processing(user_id, source_url, page_limit=10):
+def start_crawling_and_processing(user_id, source_url, page_limit=10, auto_vectorize=True):
     """
     Start the crawling and processing for a URL simultaneously with a shorter processing delay
     and improved concurrency using Thread objects
+    
+    Args:
+        user_id: User ID
+        source_url: Source URL to crawl
+        page_limit: Maximum number of pages to crawl (default: 10)
+        auto_vectorize: Whether to automatically vectorize after completion (default: True)
     """
     # Add to active jobs list
     add_active_job(user_id, source_url)
@@ -1320,7 +1415,8 @@ def start_crawling_and_processing(user_id, source_url, page_limit=10):
         'crawling_done': False,
         'processing_done': False,
         'in_final_cooldown': False,
-        'links_before_cooldown': 0
+        'links_before_cooldown': 0,
+        'auto_vectorize': auto_vectorize  # Store auto_vectorize flag in shared status
     }
 
     # Define a wrapper function to start the crawling
@@ -1483,15 +1579,15 @@ def start_crawling_and_processing(user_id, source_url, page_limit=10):
                     # Cool-down period has elapsed with no new links
                     print(f"Final cool-down period of {cooldown_duration} seconds has elapsed. No new links found. Completing job for {url}")
                     
-                    # Now mark as complete and process next in queue
-                    mark_as_complete_and_process_next(user_id, url)
+                    # Pass auto_vectorize flag when marking as complete
+                    mark_as_complete_and_process_next(user_id, url, completion_status['auto_vectorize'])
                     
         except Exception as e:
             print(f"Error in final cool-down: {str(e)}")
             traceback.print_exc()
             
             # Even if there's an error, try to move to the next URL
-            mark_as_complete_and_process_next(user_id, url)
+            mark_as_complete_and_process_next(user_id, url, completion_status['auto_vectorize'])
     
     # Start the crawling in a background thread
     crawler_thread = Thread(
@@ -1509,7 +1605,7 @@ def start_crawling_and_processing(user_id, source_url, page_limit=10):
     )
     processor_thread.start()
     
-    print(f"Started simultaneous crawling and processing for {source_url}, user {user_id}")
+    print(f"Started simultaneous crawling and processing for {source_url}, user {user_id}, auto_vectorize: {auto_vectorize}")
     return True
 
 def batch_insert_links(connection, links_data):
@@ -1591,10 +1687,18 @@ def batch_insert_links(connection, links_data):
         connection.rollback()
         return inserted_count
     
-def mark_as_complete_and_process_next(user_id, source_url):
-    """Mark a URL as complete in the queue, trigger vectorization, and start processing the next one if available"""
+def mark_as_complete_and_process_next(user_id, source_url, auto_vectorize=True):
+    """
+    Mark a URL as complete in the queue, check if all crawling & scraping is complete,
+    trigger vectorization if needed, and start processing the next URL in queue.
+    
+    Args:
+        user_id: User ID
+        source_url: Source URL to mark as complete
+        auto_vectorize: Whether to automatically vectorize after completion (default: True)
+    """
     try:
-        print(f"Marking URL as complete and checking for next URL: {source_url} for user {user_id}")
+        print(f"Marking URL as complete and checking for next URL: {source_url} for user {user_id}, auto_vectorize: {auto_vectorize}")
         
         with get_db_connection() as connection:
             with connection.cursor() as cursor:
@@ -1634,40 +1738,118 @@ def mark_as_complete_and_process_next(user_id, source_url):
                     del processing_events[process_key]
                     print(f"Cleaned up processing event for {process_key}")
                 
-                # Count scrapped documents
+                # Check if all links for this source_url have been crawled and processed
                 cursor.execute("""
-                    SELECT COUNT(*) FROM {0}
+                    SELECT 
+                        COUNT(*) as total_links,
+                        SUM(CASE WHEN IS_CRAWLED = 1 THEN 1 ELSE 0 END) as crawled_links,
+                        SUM(CASE WHEN IS_PROCESSED = 'true' OR IS_PROCESSED = 'Failed' THEN 1 ELSE 0 END) as processed_links
+                    FROM {0}
                     WHERE TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
-                """.format(SCRAPPED_TEXT_TABLE), 
+                """.format(LINKS_TO_SCRAP_TABLE), 
                    source_url=source_url, user_id=user_id)
                 
-                scrapped_count = cursor.fetchone()[0]
-                
-                if scrapped_count > 0:
-                    print(f"Found {scrapped_count} scrapped documents for {source_url}, triggering vectorization")
+                result = cursor.fetchone()
+                if result:
+                    total_links, crawled_links, processed_links = result
                     
-                    # Start vectorization in a background thread to avoid blocking
-                    def vectorize_thread():
+                    # Count scrapped documents
+                    cursor.execute("""
+                        SELECT COUNT(*) FROM {0}
+                        WHERE TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
+                    """.format(SCRAPPED_TEXT_TABLE), 
+                       source_url=source_url, user_id=user_id)
+                    
+                    scrapped_count = cursor.fetchone()[0]
+                    
+                    print(f"Stats for {source_url}: Total={total_links}, Crawled={crawled_links}, Processed={processed_links}, Scrapped={scrapped_count}")
+                    
+                    # Check if everything is complete (all links crawled and processed, and at least some content scraped)
+                    is_complete = (total_links > 0 and 
+                                  crawled_links == total_links and 
+                                  processed_links == total_links and 
+                                  scrapped_count > 0)
+                    
+                    if is_complete and auto_vectorize:
+                        print(f"All crawling and scraping complete for {source_url}. Starting vectorization (auto_vectorize={auto_vectorize}).")
+                        
+                        # Check if vectorization has already been done
+                        from oracle_chatbot import connect_to_vectdb
+                        import os
+                        
+                        VECTDB_TABLE_NAME = os.getenv("VECTDB_TABLE_NAME", "vector_files_with_10000_chunk_new")
+                        
+                        vectdb_connection = None
                         try:
-                            vectorize_result = auto_vectorize_data(user_id, source_url)
-                            print(f"Background vectorization completed for {source_url}: {vectorize_result}")
-                        except Exception as e:
-                            print(f"Error in vectorization thread: {str(e)}")
-                            traceback.print_exc()
-                    
-                    vectorization_thread = Thread(target=vectorize_thread, daemon=True)
-                    vectorization_thread.start()
-                    print(f"Started background vectorization for {source_url}")
-                else:
-                    print(f"No scrapped documents found for {source_url}, skipping vectorization")
-                
+                            vectdb_connection = connect_to_vectdb()
+                            if vectdb_connection:
+                                with vectdb_connection.cursor() as vect_cursor:
+                                    # Check if any vectors exist for this source_url
+                                    vect_cursor.execute("""
+                                        SELECT COUNT(*) FROM {0}
+                                        WHERE METADATA LIKE :source_pattern
+                                    """.format(VECTDB_TABLE_NAME), 
+                                       source_pattern=f'%"source":"{source_url}"%')
+                                    
+                                    vector_count = vect_cursor.fetchone()[0]
+                                    
+                                    if vector_count > 0:
+                                        print(f"Vectorization already done for {source_url} with {vector_count} vectors.")
+                                        should_vectorize = False
+                                    else:
+                                        print(f"No existing vectors found for {source_url}. Need to vectorize.")
+                                        should_vectorize = True
+                        except Exception as vect_error:
+                            print(f"Error checking vector status: {str(vect_error)}")
+                            should_vectorize = True  # Assume we need to vectorize if check fails
+                        finally:
+                            if vectdb_connection:
+                                vectdb_connection.close()
+                        
+                        # Trigger vectorization in a background thread if needed
+                        if should_vectorize:
+                            def vectorize_thread():
+                                try:
+                                    from oracle_chatbot import process_scrapped_text_to_vector_store, connect_to_jsondb
+                                    
+                                    # Create a connection to the JSON database
+                                    print(f"Starting vectorization for {source_url}...")
+                                    jsondb_connection = connect_to_jsondb()
+                                    
+                                    if not jsondb_connection:
+                                        print(f"Failed to connect to JSON database for vectorization")
+                                        return
+                                    
+                                    try:
+                                        # Call the vectorization function with source_level_url filter
+                                        result = process_scrapped_text_to_vector_store(
+                                            jsondb_connection, 
+                                            user_id=user_id, 
+                                            source_level_url=source_url
+                                        )
+                                        
+                                        print(f"Background vectorization completed for {source_url}: {result}")
+                                    finally:
+                                        # Ensure connection is closed
+                                        if jsondb_connection:
+                                            jsondb_connection.close()
+                                except Exception as e:
+                                    print(f"Error in vectorization thread: {str(e)}")
+                                    traceback.print_exc()
+                            
+                            vectorization_thread = Thread(target=vectorize_thread, daemon=True)
+                            vectorization_thread.start()
+                            print(f"Started background vectorization for {source_url}")
+                        
                 # Get the next URL from the queue - needs to happen after cleanup
                 next_item = get_next_from_queue(user_id)
                 
                 if next_item:
                     next_url = next_item['source_url']
                     page_limit = next_item['page_limit']
-                    print(f"Starting to process next URL: {next_url} with limit of {page_limit} pages for user {user_id}")
+                    next_auto_vectorize = next_item.get('auto_vectorize', True)  # Get auto_vectorize from queue item
+                    
+                    print(f"Starting to process next URL: {next_url} with limit of {page_limit} pages for user {user_id}, auto_vectorize: {next_auto_vectorize}")
                     
                     # Ensure there are no lingering events for this URL before starting
                     next_crawl_key = f"{user_id}:{next_url}"
@@ -1678,8 +1860,8 @@ def mark_as_complete_and_process_next(user_id, source_url):
                     if next_process_key in processing_events:
                         del processing_events[next_process_key]
                     
-                    # Start processing the next URL with its page limit
-                    start_crawling_and_processing(user_id, next_url, page_limit)
+                    # Start processing the next URL with its page limit and auto_vectorize flag
+                    start_crawling_and_processing(user_id, next_url, page_limit, next_auto_vectorize)
                     return True
                 else:
                     print(f"No more URLs in queue for user {user_id}")
@@ -1688,7 +1870,7 @@ def mark_as_complete_and_process_next(user_id, source_url):
         print(f"Error marking as complete and processing next: {str(e)}")
         traceback.print_exc()
         return False
-
+    
 def get_next_from_queue(user_id):
     """Get the next URL from the queue for a user with improved error handling"""
     try:
@@ -1698,7 +1880,8 @@ def get_next_from_queue(user_id):
             with connection.cursor() as cursor:
                 # Find the oldest unprocessed URL for this user
                 cursor.execute("""
-                    SELECT ID, SOURCE_URL, PAGE_LIMIT FROM {0}
+                    SELECT ID, SOURCE_URL, PAGE_LIMIT, NVL(AUTO_VECTORIZE, 1) AS AUTO_VECTORIZE 
+                    FROM {0}
                     WHERE USER_ID = :user_id AND PROCESSED = 0 AND PROCESSING_STARTED IS NULL
                     ORDER BY ADDED_AT ASC
                     FETCH FIRST 1 ROW ONLY
@@ -1708,7 +1891,7 @@ def get_next_from_queue(user_id):
                 row = cursor.fetchone()
                 
                 if row:
-                    queue_id, source_url, page_limit = row
+                    queue_id, source_url, page_limit, auto_vectorize = row
                     
                     # Mark as processing started with retry logic
                     retry_count = 0
@@ -1749,10 +1932,11 @@ def get_next_from_queue(user_id):
                     if verify_row:
                         print(f"Retrieved next URL from queue: {source_url} for user {user_id}")
                         
-                        # Return both the URL and the page limit
+                        # Return the URL, page limit, and auto_vectorize flag
                         return {
                             'source_url': source_url,
-                            'page_limit': page_limit or 10  # Default to 10 if None
+                            'page_limit': page_limit or 10,  # Default to 10 if None
+                            'auto_vectorize': bool(auto_vectorize)  # Convert to boolean
                         }
                     else:
                         print(f"Queue item {queue_id} could not be reserved, retrying with another item")
@@ -1765,6 +1949,7 @@ def get_next_from_queue(user_id):
         print(f"Error getting next from queue: {str(e)}")
         traceback.print_exc()
         return None
+
 def add_word_count_field():
     """
     Add a WORD_COUNT column to the SCRAPPED_TEXT table if it doesn't exist.
@@ -3509,7 +3694,7 @@ def get_all_documents(user_id):
                     elif in_queue and not is_processed and not is_processing:
                         status = 'Queued'
                     else:
-                        status = 'Processing'
+                        status = 'Pocessing'
 
                     # Create document object
                     document = {
