@@ -7,7 +7,7 @@ import logging
 import jwt
 from datetime import datetime
 import traceback
-from cors_middleware import CORSMiddleware
+from flask_cors import CORS  # Import Flask-CORS instead of custom middleware
 
 # Configure logging
 logging.basicConfig(
@@ -26,8 +26,21 @@ SECRET_KEY = os.getenv('SECRET_KEY', 'your-secret-key-fallback')
 # Create the Flask app
 app = Flask(__name__)
 
-# Apply CORS middleware
-app.wsgi_app = CORSMiddleware(app.wsgi_app)
+# Configure CORS with Flask-CORS
+allowed_origins = [
+    'http://localhost:3000',  # Local development
+    'https://smart-crawler-fe.vercel.app',
+    'https://smart-crawler-6ghm35ek8-aniruddha-mukherjees-projects-00946ecf.vercel.app'
+]
+
+# Add any CORS_ORIGINS from environment variables
+cors_origins = os.getenv('CORS_ORIGINS', '')
+if cors_origins:
+    additional_origins = [origin.strip() for origin in cors_origins.split(',') if origin.strip()]
+    allowed_origins.extend(additional_origins)
+
+# Apply CORS to the app with configuration
+CORS(app, resources={r"/*": {"origins": allowed_origins, "supports_credentials": True}})
 
 # Initialize database connection pools
 from file_api import initialize_connection_pool
@@ -108,49 +121,11 @@ def verify_token():
         print(f"Invalid Token Error: {e}")
         return None
 
-# CORS handling for all responses
-@app.after_request
-def add_cors_headers(response):
-    origin = request.headers.get('Origin')
-    
-    if origin:
-        # Set allowed origins - update with your actual domains
-        allowed_origins = [
-            'http://localhost:3000',
-            'https://smart-crawler-fe.vercel.app',
-            'https://smart-crawler-6ghm35ek8-aniruddha-mukherjees-projects-00946ecf.vercel.app'
-        ]
-        
-        # Check if the request origin is allowed
-        if origin in allowed_origins:
-            response.headers['Access-Control-Allow-Origin'] = origin
-            response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
-            response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With'
-            response.headers['Access-Control-Allow-Credentials'] = 'true'
-    
-    return response
-
 # Handle all OPTIONS requests globally
 @app.route('/', defaults={'path': ''}, methods=['OPTIONS'])
 @app.route('/<path:path>', methods=['OPTIONS'])
 def options_route(path):
-    origin = request.headers.get('Origin')
-    allowed_origins = [
-        'http://localhost:3000',  # For development
-        'https://smart-crawler-fe.vercel.app',
-        'https://smart-crawler-6ghm35ek8-aniruddha-mukherjees-projects-00946ecf.vercel.app'
-    ]
-    
     response = make_response()
-    
-    if origin in allowed_origins:
-        response.headers['Access-Control-Allow-Origin'] = origin
-    else:
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With'
-    response.headers['Access-Control-Allow-Credentials'] = 'true'
     response.headers['Content-Type'] = 'text/plain'
     response.headers['Content-Length'] = '0'
     return response

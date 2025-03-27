@@ -1,6 +1,7 @@
-/venv/
+
 /file/
 /file2/
 /new.py/
 /.env/
 /__pycache__/
+/env/
