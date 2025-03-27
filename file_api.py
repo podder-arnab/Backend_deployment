@@ -3744,7 +3744,7 @@ def get_all_documents(user_id):
                     elif in_queue and not is_processed and not is_processing:
                         status = 'Queued'
                     else:
-                        status = 'Pocessing'
+                        status = 'Processing'
 
                     # Create document object
                     document = {
