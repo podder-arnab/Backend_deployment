@@ -44,7 +44,7 @@ if not SECRET_KEY:
     raise ValueError("SECRET_KEY must be set")
 # Initialize connection pool
 connection_pool = None
-MAX_RETRIES = 3
+MAX_RETRIES = 30
 RETRY_DELAY = 1
 
 def initialize_connection_pool():
@@ -59,8 +59,8 @@ def initialize_connection_pool():
             min=2,
             max=10,
             increment=1,
-            wait_timeout=1000,
-            max_lifetime_session=28800,
+            wait_timeout=1000000,
+            max_lifetime_session=28800000,
             config_dir="Wallet_jsondb",
             wallet_location="Wallet_jsondb",
             wallet_password=ORACLE_PASSWORD
