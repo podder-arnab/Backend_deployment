@@ -36,6 +36,12 @@ TOKEN_EXPIRY_HOURS = int(os.getenv('TOKEN_EXPIRY_HOURS', '24'))
 # Create the blueprint
 user_api = Blueprint('user_api', __name__)
 
+
+# In your user_api.py or app.py
+SECRET_KEY = os.getenv('SECRET_KEY')
+if not SECRET_KEY:
+    logger.critical("SECRET_KEY is not set in environment variables!")
+    raise ValueError("SECRET_KEY must be set")
 # Initialize connection pool
 connection_pool = None
 MAX_RETRIES = 3

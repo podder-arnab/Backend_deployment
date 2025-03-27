@@ -64,6 +64,24 @@ def chat():
         api_key = data.get('api_key')
         source_level_url = data.get('source_level_url')
         
+        # Extract user_id from the Authorization header
+        user_id = None
+        auth_header = request.headers.get('Authorization')
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header.split(" ")[1]
+            try:
+                # Import SECRET_KEY from app.py
+                from app import SECRET_KEY
+                import jwt
+                
+                # Decode the token to get user_id
+                decoded = jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
+                user_id = decoded.get('user_id')
+                print(f"Extracted user_id {user_id} from JWT token")
+            except Exception as jwt_error:
+                print(f"Could not extract user_id from token: {str(jwt_error)}")
+                # Continue without user_id
+        
         if not message:
             return jsonify({
                 'status': 'error',
@@ -71,8 +89,8 @@ def chat():
                 'timestamp': datetime.now().isoformat()
             }), 400
         
-        # Log the request with source_level_url for debugging
-        print(f"Chat request: message='{message[:30]}...', source_level_url='{source_level_url}', session_id='{session_id}'")
+        # Log the request with source_level_url and user_id for debugging
+        print(f"Chat request: message='{message[:30]}...', source_level_url='{source_level_url}', session_id='{session_id}', user_id='{user_id}'")
         
         # Create a new database connection for this request
         db_conn = connect_to_jsondb()
@@ -84,7 +102,7 @@ def chat():
             }), 500
         
         try:
-            # Process the chat request with the source_level_url
+            # Process the chat request with the source_level_url and user_id
             import asyncio
             
             # Add debug to check existing session if session_id provided
@@ -92,16 +110,21 @@ def chat():
                 session_check = asyncio.run(get_session(db_conn, session_id))
                 if session_check:
                     print(f"Found existing session {session_id} with {len(session_check.get('messages', []))} messages")
+                    
+                    # If this is an existing session without user_id but we have one now, log it
+                    if user_id and not session_check.get('user_id'):
+                        print(f"Will associate session {session_id} with user_id {user_id}")
                 else:
                     print(f"Session {session_id} not found, will create new session")
             
-            response = asyncio.run(process_chat_request(db_conn, message, session_id, api_key, source_level_url))
+            # Pass user_id to process_chat_request
+            response = asyncio.run(process_chat_request(db_conn, message, session_id, api_key, source_level_url, user_id))
             
             # Verify session was saved after processing
             if response.session_id:
                 saved_session = asyncio.run(get_session(db_conn, response.session_id))
                 if saved_session:
-                    print(f"Verified session {response.session_id} was saved with {len(saved_session.get('messages', []))} messages")
+                    print(f"Verified session {response.session_id} was saved with {len(saved_session.get('messages', []))} messages and user_id: {saved_session.get('user_id')}")
                 else:
                     print(f"WARNING: Could not verify session {response.session_id} was saved!")
             
@@ -131,10 +154,9 @@ def chat():
             'message': str(e),
             'timestamp': datetime.now().isoformat()
         }), 500
-
+    
 # Apply the same pattern to other async endpoints
 @chatbot_api.route('/vectorize', methods=['POST'])
-@api_key_required
 def vectorize_scrapped_text():  # Remove async keyword
     """
     Process scrapped text data into the vector store
@@ -192,8 +214,29 @@ def get_conversations():
     
     Query parameters:
     - api_key: API key for authentication
+    - user_id: (Optional) Filter conversations by user ID
     """
     try:
+        # Extract user_id from query parameters 
+        user_id = request.args.get('user_id')
+        
+        # If not in query params, try to extract from Authorization header
+        if not user_id:
+            auth_header = request.headers.get('Authorization')
+            if auth_header and auth_header.startswith("Bearer "):
+                token = auth_header.split(" ")[1]
+                try:
+                    from app import SECRET_KEY  # Import the secret key
+                    import jwt
+                    decoded = jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
+                    user_id = decoded.get('user_id')
+                    print(f"Extracted user_id {user_id} from JWT token")
+                except Exception as jwt_error:
+                    print(f"Could not extract user_id from token: {str(jwt_error)}")
+                    # Continue without user_id
+        
+        print(f"Getting conversations for user_id: {user_id}")
+        
         # Create a new database connection for this request
         db_conn = connect_to_jsondb()
         if not db_conn:
@@ -211,11 +254,11 @@ def get_conversations():
             print(f"CHAT_SESSIONS table contains {count} rows")
             cursor.close()
             
-            # Get all conversations with improved function
+            # Get all conversations with improved function, passing user_id
             import asyncio
-            conversations = asyncio.run(get_all_conversations(db_conn))
+            conversations = asyncio.run(get_all_conversations(db_conn, user_id))
             
-            print(f"Retrieved {len(conversations)} conversations")
+            print(f"Retrieved {len(conversations)} conversations for user_id: {user_id}")
             
             # Include debug info in the response during testing
             debug_info = {

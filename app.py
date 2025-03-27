@@ -5,8 +5,9 @@ from chatbot_api import chatbot_api  # Import the chatbot API blueprint
 import os
 import logging
 import jwt
-import datetime 
+from datetime import datetime
 import traceback
+
 
 # Configure logging
 logging.basicConfig(
@@ -70,7 +71,7 @@ def standardize_error_response(error, code=None, status_code=500):
     response = {
         'status': 'error',
         'message': error_message,
-        'timestamp': datetime.datetime.now().isoformat()
+        'timestamp': datetime.now().isoformat()
     }
     
     if code:

@@ -50,12 +50,13 @@ class Message:
         }
 
 class ChatSession:
-    def __init__(self, session_id: str, title: str = "New Conversation"):
+    def __init__(self, session_id: str, title: str = "New Conversation", user_id: str = None):
         self.session_id = session_id
         self.messages = []
         self.created_at = datetime.utcnow()
         self.last_updated = datetime.utcnow()
         self.title = title
+        self.user_id = user_id  # Add user_id field
     
     def to_dict(self):
         return {
@@ -63,7 +64,8 @@ class ChatSession:
             "messages": [msg.to_dict() for msg in self.messages],
             "created_at": self.created_at.isoformat(),
             "last_updated": self.last_updated.isoformat(),
-            "title": self.title
+            "title": self.title,
+            "user_id": self.user_id  # Include user_id in the dictionary
         }
 
 class ChatResponse:
@@ -450,7 +452,7 @@ async def get_session(db_conn, session_id):
         if cursor:
             cursor.close()
 
-async def update_session(db_conn, session_id, user_message, assistant_response):
+async def update_session(db_conn, session_id, user_message, assistant_response, user_id=None):
     """
     Update a chat session with new messages with improved error handling and verification
     
@@ -459,13 +461,14 @@ async def update_session(db_conn, session_id, user_message, assistant_response):
         session_id: The ID of the session to update
         user_message: The user's message to add
         assistant_response: The assistant's response to add
+        user_id: Optional user ID to associate with the session
         
     Returns:
         bool: True if successful, False otherwise
     """
     cursor = None
     try:
-        print(f"Updating session {session_id} with new messages")
+        print(f"Updating session {session_id} with new messages, user_id: {user_id}")
         
         # Get the current session
         session = await get_session(db_conn, session_id)
@@ -473,7 +476,7 @@ async def update_session(db_conn, session_id, user_message, assistant_response):
             print(f"Session {session_id} not found, creating a new session")
             # Create a new session since the specified one doesn't exist
             new_session_id = str(int(time.time()))
-            new_session = ChatSession(session_id=new_session_id, title="New Conversation")
+            new_session = ChatSession(session_id=new_session_id, title="New Conversation", user_id=user_id)
             session = new_session.to_dict()
             session_id = new_session_id
             
@@ -485,7 +488,10 @@ async def update_session(db_conn, session_id, user_message, assistant_response):
             """
             cursor.execute(insert_query, (json.dumps(session),))
             db_conn.commit()
-            print(f"Created new session {session_id} as fallback")
+            print(f"Created new session {session_id} as fallback with user_id: {user_id}")
+        elif user_id and not session.get("user_id"):
+            # Update the user_id if it wasn't set before
+            session["user_id"] = user_id
         
         # Create message objects
         message_user = {
@@ -516,17 +522,23 @@ async def update_session(db_conn, session_id, user_message, assistant_response):
             WHERE JSON_VALUE(JSON_DATA, '$.session_id') = :2
             """
             
-            patch_data = json.dumps({
+            # Include user_id in the patch if it was provided
+            patch_data = {
                 "messages": updated_messages,
                 "last_updated": last_updated
-            })
+            }
             
-            cursor.execute(update_query, [patch_data, session_id])
+            if user_id and not session.get("user_id"):
+                patch_data["user_id"] = user_id
+                
+            patch_json = json.dumps(patch_data)
+            
+            cursor.execute(update_query, [patch_json, session_id])
             rows_updated = cursor.rowcount
             
             if rows_updated > 0:
                 db_conn.commit()
-                print(f"Updated session {session_id} using JSON_MERGEPATCH, {rows_updated} rows affected")
+                print(f"Updated session {session_id} using JSON_MERGEPATCH, {rows_updated} rows affected, user_id: {session.get('user_id') or user_id}")
                 
                 # Verify the update
                 updated_session = await get_session(db_conn, session_id)
@@ -543,6 +555,10 @@ async def update_session(db_conn, session_id, user_message, assistant_response):
                     # Update the session object and replace it entirely
                     session['messages'] = updated_messages
                     session['last_updated'] = last_updated
+                    
+                    # Add user_id if provided and not already set
+                    if user_id and not session.get("user_id"):
+                        session["user_id"] = user_id
                     
                     # Find the row by ID using a LIKE clause as fallback
                     select_id_query = """
@@ -637,12 +653,13 @@ async def update_session_title(db_conn, session_id, new_title):
         if cursor:
             cursor.close()
 
-async def get_all_conversations(db_conn):
+async def get_all_conversations(db_conn, user_id=None):
     """
     Get all chat conversations with improved error handling and debugging
     
     Args:
         db_conn: Oracle database connection
+        user_id: Optional user ID to filter conversations by
         
     Returns:
         list: List of conversation summary objects
@@ -687,6 +704,7 @@ async def get_all_conversations(db_conn):
             
             conversations = []
             error_count = 0
+            filtered_count = 0
             
             for idx, row in enumerate(rows):
                 try:
@@ -700,6 +718,14 @@ async def get_all_conversations(db_conn):
                         session_data = json.loads(session_data)
                     elif isinstance(session_data, bytes):
                         session_data = json.loads(session_data.decode('utf-8'))
+                    
+                    # If user_id filter is provided, check if this session belongs to the user
+                    session_user_id = session_data.get("user_id")
+                    
+                    # Skip sessions that don't match the user_id filter
+                    if user_id is not None and str(session_user_id) != str(user_id):
+                        filtered_count += 1
+                        continue
                     
                     # Extract session ID and title with fallbacks
                     session_id = session_data.get("session_id", f"unknown-{idx}")
@@ -724,7 +750,8 @@ async def get_all_conversations(db_conn):
                         "title": title,
                         "last_message": last_message,
                         "last_updated": last_updated,
-                        "message_count": len(messages)
+                        "message_count": len(messages),
+                        "user_id": session_user_id
                     })
                     
                 except Exception as row_error:
@@ -735,6 +762,9 @@ async def get_all_conversations(db_conn):
             if error_count > 0:
                 print(f"Encountered errors processing {error_count} out of {len(rows)} rows")
             
+            if user_id is not None:
+                print(f"Filtered {filtered_count} conversations that didn't match user_id {user_id}")
+                
             return conversations
             
         except Exception as query_error:
@@ -759,11 +789,17 @@ async def get_all_conversations(db_conn):
                     if isinstance(data, str):
                         try:
                             parsed = json.loads(data)
+                            
+                            # Apply user_id filter in fallback mode too
+                            if user_id is not None and str(parsed.get("user_id")) != str(user_id):
+                                continue
+                                
                             conversations.append({
                                 "session_id": parsed.get("session_id", f"unknown-{idx}"),
                                 "title": parsed.get("title", "Untitled"),
                                 "last_message": "Message retrieval not available in fallback mode",
-                                "last_updated": "Unknown"
+                                "last_updated": "Unknown",
+                                "user_id": parsed.get("user_id")
                             })
                         except json.JSONDecodeError:
                             print(f"Row {idx} contains invalid JSON")
@@ -786,7 +822,7 @@ def verify_api_key(api_key):
         return True
     return False
 
-async def process_chat_request(db_conn, message, session_id=None, api_key=None, source_level_url=None):
+async def process_chat_request(db_conn, message, session_id=None, api_key=None, source_level_url=None, user_id=None):
     """
     Process a chat request, filtering by source_level_url in the METADATA JSON field
     with simpler query approach
@@ -797,6 +833,7 @@ async def process_chat_request(db_conn, message, session_id=None, api_key=None, 
         session_id: Optional session ID
         api_key: API key for authorization
         source_level_url: URL to restrict the knowledge retrieval context
+        user_id: User ID of the authenticated user
         
     Returns:
         ChatResponse object
@@ -831,11 +868,24 @@ async def process_chat_request(db_conn, message, session_id=None, api_key=None, 
                     else:
                         session = session_data
                     title = session.get("title", "New Conversation")
+                    
+                    # If user_id isn't in session but is provided, add it now
+                    if user_id and not session.get("user_id"):
+                        session["user_id"] = user_id
+                        # Update the session with the user_id
+                        update_query = """
+                        UPDATE CHAT_SESSIONS
+                        SET JSON_DATA = JSON_MERGEPATCH(JSON_DATA, :1)
+                        WHERE JSON_VALUE(JSON_DATA, '$.session_id') = :2
+                        """
+                        patch_data = json.dumps({"user_id": user_id})
+                        cursor.execute(update_query, [patch_data, session_id])
+                        db_conn.commit()
                 else:
                     # Session ID was provided but doesn't exist. Create a new one.
                     title = f"Conversation about {source_level_url}" if source_level_url else "New Conversation"
                     new_session_id = str(int(time.time()))
-                    new_session = ChatSession(session_id=new_session_id, title=title)
+                    new_session = ChatSession(session_id=new_session_id, title=title, user_id=user_id)
                     
                     # Insert the session into the database
                     insert_query = """
@@ -846,14 +896,14 @@ async def process_chat_request(db_conn, message, session_id=None, api_key=None, 
                     cursor.execute(insert_query, (session_json,))
                     db_conn.commit()
                     
-                    print(f"New session {new_session_id} created successfully.")
+                    print(f"New session {new_session_id} created successfully with user_id: {user_id}")
                     session_id = new_session_id
                     session = new_session.to_dict()
             else:
                 # No session ID provided. Create a new session.
                 title = f"Conversation about {source_level_url}" if source_level_url else "New Conversation"
                 new_session_id = str(int(time.time()))
-                new_session = ChatSession(session_id=new_session_id, title=title)
+                new_session = ChatSession(session_id=new_session_id, title=title, user_id=user_id)
                 
                 # Insert the session into the database
                 insert_query = """
@@ -864,7 +914,7 @@ async def process_chat_request(db_conn, message, session_id=None, api_key=None, 
                 cursor.execute(insert_query, (session_json,))
                 db_conn.commit()
                 
-                print(f"New session {new_session_id} created successfully.")
+                print(f"New session {new_session_id} created successfully with user_id: {user_id}")
                 session_id = new_session_id
                 session = new_session.to_dict()
         finally:
@@ -982,7 +1032,7 @@ async def process_chat_request(db_conn, message, session_id=None, api_key=None, 
                     session_id=session_id,
                     title=title
                 )
-                await update_session(db_conn, session_id, message, response.answer)
+                await update_session(db_conn, session_id, message, response.answer, user_id)
                 return response
             
             # Prepare documents and chat history
@@ -1039,8 +1089,8 @@ async def process_chat_request(db_conn, message, session_id=None, api_key=None, 
                 source_note = f"\n\nThis information is sourced from: {source_level_url} and its related pages."
                 answer_text += source_note
             
-            # Update session with new messages
-            await update_session(db_conn, session_id, message, answer_text)
+            # Update session with new messages - pass user_id as well
+            await update_session(db_conn, session_id, message, answer_text, user_id)
             
             # Only include sources if the answer was found in the context
             final_sources = sources if "Answer is not available in the context" not in answer_text else []

@@ -1687,22 +1687,20 @@ def batch_insert_links(connection, links_data):
         connection.rollback()
         return inserted_count
     
+# Replace the mark_as_complete_and_process_next function in file_api.py with this version:
+
 def mark_as_complete_and_process_next(user_id, source_url, auto_vectorize=True):
     """
-    Mark a URL as complete in the queue, check if all crawling & scraping is complete,
-    trigger vectorization if needed, and start processing the next URL in queue.
-    
-    Args:
-        user_id: User ID
-        source_url: Source URL to mark as complete
-        auto_vectorize: Whether to automatically vectorize after completion (default: True)
+    Mark a URL as complete in the queue, update SOURCE_URLS.IS_PROCESSED to 1,
+    trigger vectorization if all crawling & scraping is complete,
+    and start processing the next URL in queue ONLY after vectorization is done.
     """
     try:
         print(f"Marking URL as complete and checking for next URL: {source_url} for user {user_id}, auto_vectorize: {auto_vectorize}")
         
         with get_db_connection() as connection:
             with connection.cursor() as cursor:
-                # Mark the current URL as complete
+                # Mark the current URL as complete in PROCESSING_QUEUE
                 cursor.execute("""
                     UPDATE {0} SET PROCESSED = 1, PROCESSING_COMPLETED = CURRENT_TIMESTAMP
                     WHERE USER_ID = :user_id AND SOURCE_URL = :source_url
@@ -1710,35 +1708,8 @@ def mark_as_complete_and_process_next(user_id, source_url, auto_vectorize=True):
                    user_id=user_id, source_url=source_url)
                 
                 rows_updated = cursor.rowcount
-                connection.commit()
                 
-                print(f"Marked URL as complete: {source_url} for user {user_id}, rows affected: {rows_updated}")
-                
-                # Update the active user jobs tracking
-                if user_id in active_user_jobs:
-                    if source_url in active_user_jobs[user_id]:
-                        active_user_jobs[user_id].remove(source_url)
-                        print(f"Removed {source_url} from active jobs for user {user_id}")
-                    if not active_user_jobs[user_id]:
-                        del active_user_jobs[user_id]
-                        print(f"No more active jobs for user {user_id}, removed from tracking")
-                
-                # Clean up event objects
-                crawl_key = f"{user_id}:{source_url}"
-                process_key = f"{user_id}:{source_url}"
-                
-                # Only delete the events if they exist
-                if crawl_key in crawling_events:
-                    crawling_events[crawl_key].set()  # Set the event first to signal threads to terminate
-                    del crawling_events[crawl_key]
-                    print(f"Cleaned up crawling event for {crawl_key}")
-                    
-                if process_key in processing_events:
-                    processing_events[process_key].set()  # Set the event first to signal threads to terminate
-                    del processing_events[process_key]
-                    print(f"Cleaned up processing event for {process_key}")
-                
-                # Check if all links for this source_url have been crawled and processed
+                # Calculate if all links for this source_url have been crawled and processed
                 cursor.execute("""
                     SELECT 
                         COUNT(*) as total_links,
@@ -1764,92 +1735,171 @@ def mark_as_complete_and_process_next(user_id, source_url, auto_vectorize=True):
                     
                     print(f"Stats for {source_url}: Total={total_links}, Crawled={crawled_links}, Processed={processed_links}, Scrapped={scrapped_count}")
                     
-                    # Check if everything is complete (all links crawled and processed, and at least some content scraped)
-                    is_complete = (total_links > 0 and 
-                                  crawled_links == total_links and 
-                                  processed_links == total_links and 
-                                  scrapped_count > 0)
+                    # Update the active user jobs tracking immediately to prevent new jobs from starting
+                    if user_id in active_user_jobs:
+                        if source_url in active_user_jobs[user_id]:
+                            active_user_jobs[user_id].remove(source_url)
+                            print(f"Removed {source_url} from active jobs for user {user_id}")
+                        if not active_user_jobs[user_id]:
+                            del active_user_jobs[user_id]
+                            print(f"No more active jobs for user {user_id}, removed from tracking")
                     
-                    if is_complete and auto_vectorize:
-                        print(f"All crawling and scraping complete for {source_url}. Starting vectorization (auto_vectorize={auto_vectorize}).")
+                    # Clean up event objects
+                    crawl_key = f"{user_id}:{source_url}"
+                    process_key = f"{user_id}:{source_url}"
+                    
+                    # Only delete the events if they exist
+                    if crawl_key in crawling_events:
+                        crawling_events[crawl_key].set()  # Set the event first to signal threads to terminate
+                        del crawling_events[crawl_key]
+                        print(f"Cleaned up crawling event for {crawl_key}")
                         
-                        # Check if vectorization has already been done
-                        from oracle_chatbot import connect_to_vectdb
-                        import os
+                    if process_key in processing_events:
+                        processing_events[process_key].set()  # Set the event first to signal threads to terminate
+                        del processing_events[process_key]
+                        print(f"Cleaned up processing event for {process_key}")
+                    
+                    # Modified logic for job completion:
+                    # 1. Consider complete if any documents are scraped
+                    # 2. AND all identified links are processed
+                    # This simpler condition is more reliable
+                    is_complete = (scrapped_count > 0 and processed_links > 0)
+                    
+                    print(f"Job completion check for {source_url}: is_complete = {is_complete}")
+                    print(f"Scrapped: {scrapped_count}, Processed: {processed_links}, Total: {total_links}")
+                    
+                    if is_complete:
+                        print(f"All crawling and scraping complete for {source_url}. Updating IS_PROCESSED flag.")
                         
-                        VECTDB_TABLE_NAME = os.getenv("VECTDB_TABLE_NAME", "vector_files_with_10000_chunk_new")
+                        # Update SOURCE_URLS table to set IS_PROCESSED = 1
+                        cursor.execute("""
+                            UPDATE {0}
+                            SET IS_PROCESSED = 1
+                            WHERE SOURCE_URL = :source_url AND USER_ID = :user_id
+                        """.format(SOURCE_URLS_TABLE),
+                           source_url=source_url, user_id=user_id)
                         
-                        vectdb_connection = None
-                        try:
-                            vectdb_connection = connect_to_vectdb()
-                            if vectdb_connection:
-                                with vectdb_connection.cursor() as vect_cursor:
-                                    # Check if any vectors exist for this source_url
-                                    vect_cursor.execute("""
-                                        SELECT COUNT(*) FROM {0}
-                                        WHERE METADATA LIKE :source_pattern
-                                    """.format(VECTDB_TABLE_NAME), 
-                                       source_pattern=f'%"source":"{source_url}"%')
-                                    
-                                    vector_count = vect_cursor.fetchone()[0]
-                                    
-                                    if vector_count > 0:
-                                        print(f"Vectorization already done for {source_url} with {vector_count} vectors.")
-                                        should_vectorize = False
-                                    else:
-                                        print(f"No existing vectors found for {source_url}. Need to vectorize.")
-                                        should_vectorize = True
-                        except Exception as vect_error:
-                            print(f"Error checking vector status: {str(vect_error)}")
-                            should_vectorize = True  # Assume we need to vectorize if check fails
-                        finally:
-                            if vectdb_connection:
-                                vectdb_connection.close()
+                        # Commit the changes to ensure the flag is updated
+                        connection.commit()
                         
-                        # Trigger vectorization in a background thread if needed
-                        if should_vectorize:
-                            def vectorize_thread():
-                                try:
-                                    from oracle_chatbot import process_scrapped_text_to_vector_store, connect_to_jsondb
-                                    
-                                    # Create a connection to the JSON database
-                                    print(f"Starting vectorization for {source_url}...")
+                        print(f"Marked URL {source_url} as IS_PROCESSED=1 for user {user_id}")
+                        
+                        # Vectorize synchronously if auto_vectorize is enabled
+                        if auto_vectorize:
+                            # Add an entry to PROGRESS_HISTORY_TABLE about vectorization starting
+                            try:
+                                cursor.execute("""
+                                    INSERT INTO {0} (
+                                        SOURCE_URL, TIMESTAMP, OPERATION_STATUS
+                                    ) VALUES (
+                                        :source_url, CURRENT_TIMESTAMP, 'VECTORIZING'
+                                    )
+                                """.format(PROGRESS_HISTORY_TABLE),
+                                   source_url=source_url)
+                                connection.commit()
+                            except Exception as e:
+                                print(f"Warning: Couldn't log vectorization start: {str(e)}")
+                            
+                            # Print very visible start message
+                            for i in range(3):
+                                print(f"{'='*50}")
+                            print(f"🔄 VECTORIZATION STARTED FOR {source_url}")
+                            for i in range(3):
+                                print(f"{'='*50}")
+                            
+                            # Run vectorization synchronously
+                            vectorization_success = False
+                            try:
+                                from oracle_chatbot import process_scrapped_text_to_vector_store, connect_to_jsondb
+                                
+                                # First check if this URL already has vectors
+                                vector_count = 0
+                                # To get vector count, that code can stay
+                                
+                                # If not already vectorized, do it now - CRITICAL PART
+                                if vector_count == 0:
+                                    print(f"🔄 VECTORIZING: Creating database connection for {source_url}...")
                                     jsondb_connection = connect_to_jsondb()
                                     
                                     if not jsondb_connection:
-                                        print(f"Failed to connect to JSON database for vectorization")
-                                        return
+                                        print(f"❌ VECTORIZATION FAILED: Failed to connect to JSON database")
+                                        raise Exception("Failed to connect to JSON database")
                                     
                                     try:
-                                        # Call the vectorization function with source_level_url filter
+                                        # Call the vectorization function with source_level_url and user_id
+                                        print(f"🔄 VECTORIZING: Processing {source_url} for user {user_id}...")
+                                        
                                         result = process_scrapped_text_to_vector_store(
                                             jsondb_connection, 
                                             user_id=user_id, 
                                             source_level_url=source_url
                                         )
                                         
-                                        print(f"Background vectorization completed for {source_url}: {result}")
+                                        print(f"✅ VECTORIZATION COMPLETED FOR {source_url}: {result}")
+                                        vectorization_success = True
                                     finally:
-                                        # Ensure connection is closed
                                         if jsondb_connection:
                                             jsondb_connection.close()
-                                except Exception as e:
-                                    print(f"Error in vectorization thread: {str(e)}")
-                                    traceback.print_exc()
+                                
+                                # Update PROGRESS_HISTORY_TABLE about vectorization completion
+                                try:
+                                    cursor.execute("""
+                                        INSERT INTO {0} (
+                                            SOURCE_URL, TIMESTAMP, OPERATION_STATUS
+                                        ) VALUES (
+                                            :source_url, CURRENT_TIMESTAMP, 'VECTORIZED'
+                                        )
+                                    """.format(PROGRESS_HISTORY_TABLE),
+                                       source_url=source_url)
+                                    connection.commit()
+                                except Exception as progress_error:
+                                    print(f"Warning: Couldn't log vectorization completion: {str(progress_error)}")
                             
-                            vectorization_thread = Thread(target=vectorize_thread, daemon=True)
-                            vectorization_thread.start()
-                            print(f"Started background vectorization for {source_url}")
-                        
-                # Get the next URL from the queue - needs to happen after cleanup
+                            except Exception as e:
+                                print(f"❌ VECTORIZATION FAILED: Error processing vectors for {source_url}: {str(e)}")
+                                traceback.print_exc()
+                                
+                                # Log error to PROGRESS_HISTORY_TABLE
+                                try:
+                                    cursor.execute("""
+                                        INSERT INTO {0} (
+                                            SOURCE_URL, TIMESTAMP, OPERATION_STATUS
+                                        ) VALUES (
+                                            :source_url, CURRENT_TIMESTAMP, :status
+                                        )
+                                    """.format(PROGRESS_HISTORY_TABLE),
+                                       source_url=source_url, 
+                                       status=f"VECTORIZATION_FAILED: {str(e)[:100]}")
+                                    connection.commit()
+                                except Exception as progress_error:
+                                    print(f"Warning: Couldn't log vectorization error: {str(progress_error)}")
+                            
+                            # Print very visible completion message
+                            for i in range(3):
+                                print(f"{'='*50}")
+                            
+                            if vectorization_success:
+                                print(f"✅ VECTORIZATION COMPLETED SUCCESSFULLY FOR {source_url}")
+                            else:
+                                print(f"❌ VECTORIZATION FAILED FOR {source_url}")
+                                
+                            for i in range(3):
+                                print(f"{'='*50}")
+                    else:
+                        print(f"Job not complete for {source_url}, skipping vectorization")
+                    
+                # Commit all the updates
+                connection.commit()
+                
+                # Get the next URL from the queue AFTER vectorization is complete
                 next_item = get_next_from_queue(user_id)
                 
                 if next_item:
                     next_url = next_item['source_url']
                     page_limit = next_item['page_limit']
-                    next_auto_vectorize = next_item.get('auto_vectorize', True)  # Get auto_vectorize from queue item
+                    next_auto_vectorize = next_item.get('auto_vectorize', True)
                     
-                    print(f"Starting to process next URL: {next_url} with limit of {page_limit} pages for user {user_id}, auto_vectorize: {next_auto_vectorize}")
+                    print(f"Starting to process next URL: {next_url} with limit of {page_limit} pages for user {user_id}")
                     
                     # Ensure there are no lingering events for this URL before starting
                     next_crawl_key = f"{user_id}:{next_url}"
@@ -3827,7 +3877,120 @@ def get_total_words(user_id):
         print(f"Error getting total words: {str(e)}")
         traceback.print_exc()
         return standardize_error_response(str(e), 'SERVER_ERROR', 500)  
-      
+@file_api.route('/vectorization-ready', methods=['GET'])
+@token_required
+def check_vectorization_ready(user_id):
+    """
+    Check if vectorization is complete for a source URL and return "ready" when it's done
+    
+    Query parameters:
+    - source_url: The URL to check for vectorization status
+    
+    Returns:
+        JSON: {"status": "ready"} when vectorization is complete, or 
+              {"status": "pending", "message": "..."} when still in progress
+    """
+    try:
+        source_url = request.args.get('source_url')
+        
+        if not source_url:
+            return standardize_error_response('source_url parameter is required.', 'MISSING_PARAM', 400)
+        
+        # Connect to vector database to check if vectors exist
+        from oracle_chatbot import connect_to_vectdb
+        from langchain_google_genai import GoogleGenerativeAIEmbeddings
+        from langchain_community.vectorstores import OracleVS
+        from langchain_community.vectorstores.utils import DistanceStrategy
+        import os
+        
+        # Get the VECTDB_TABLE_NAME and GOOGLE_API_KEY
+        VECTDB_TABLE_NAME = os.getenv("VECTDB_TABLE_NAME", "vector_files_with_10000_chunk_new")
+        GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+        
+        vectdb_connection = connect_to_vectdb()
+        if not vectdb_connection:
+            return jsonify({
+                'status': 'error',
+                'message': 'Failed to connect to vector database',
+                'timestamp': datetime.now().isoformat()
+            }), 500
+        
+        try:
+            # Use a query to check if any vectors exist for this source_url
+            with vectdb_connection.cursor() as cursor:
+                # Check the vector store metadata to see if any entries are for this source_url
+                cursor.execute("""
+                    SELECT COUNT(*) FROM {0}
+                    WHERE METADATA LIKE :source_pattern
+                """.format(VECTDB_TABLE_NAME), 
+                   source_pattern=f'%"source":"{source_url}"%')
+                
+                vector_count = cursor.fetchone()[0]
+                
+                # Also check if crawling/processing is complete
+                with get_db_connection() as processing_conn:
+                    with processing_conn.cursor() as processing_cursor:
+                        # Check if URL exists in the processing queue and is marked as complete
+                        processing_cursor.execute("""
+                            SELECT PROCESSED, PROCESSING_COMPLETED 
+                            FROM {0}
+                            WHERE SOURCE_URL = :source_url AND USER_ID = :user_id
+                        """.format(PROCESSING_QUEUE_TABLE), 
+                           source_url=source_url, user_id=user_id)
+                        
+                        processing_row = processing_cursor.fetchone()
+                        crawling_complete = False
+                        
+                        if processing_row and processing_row[0] == 1:
+                            crawling_complete = True
+                
+                # Check if there are any documents for this source
+                with get_db_connection() as text_conn:
+                    with text_conn.cursor() as text_cursor:
+                        text_cursor.execute("""
+                            SELECT COUNT(*) FROM {0}
+                            WHERE TOP_LEVEL_SOURCE = :source_url AND USER_ID = :user_id
+                        """.format(SCRAPPED_TEXT_TABLE), 
+                           source_url=source_url, user_id=user_id)
+                        
+                        document_count = text_cursor.fetchone()[0]
+                
+                # Determine status
+                if vector_count > 0 and crawling_complete:
+                    status = "ready"
+                    message = f"Vectorization is complete with {vector_count} vector entries."
+                elif document_count == 0:
+                    status = "pending"
+                    message = "No documents have been crawled yet for this source URL."
+                elif not crawling_complete:
+                    status = "pending"
+                    message = "Crawling and processing is still in progress."
+                else:
+                    status = "pending"
+                    message = f"Vectorization is still in progress. {document_count} documents available, but no vectors found yet."
+                
+                # Return simple response based on status
+                if status == "ready":
+                    return jsonify({
+                        'status': status,
+                        'timestamp': datetime.now().isoformat()
+                    })
+                else:
+                    return jsonify({
+                        'status': status,
+                        'message': message,
+                        'timestamp': datetime.now().isoformat()
+                    })
+                
+        finally:
+            if vectdb_connection:
+                vectdb_connection.close()
+    
+    except Exception as e:
+        traceback_str = traceback.format_exc()
+        print(f"Error checking vectorization ready status: {str(e)}\n{traceback_str}")
+        return standardize_error_response(str(e), 'SERVER_ERROR', 500)      
+
 @file_api.route('/vectorization-status', methods=['GET'])
 @token_required
 def get_vectorization_status(user_id):
