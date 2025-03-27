@@ -7,7 +7,7 @@ import logging
 import jwt
 from datetime import datetime
 import traceback
-
+from flask_cors import CORS
 
 # Configure logging
 logging.basicConfig(
@@ -26,6 +26,7 @@ SECRET_KEY = os.getenv('SECRET_KEY', 'your-secret-key-fallback')
 # Create the Flask app
 app = Flask(__name__)
 
+CORS(app)
 
 # Initialize database connection pools
 from file_api import initialize_connection_pool
