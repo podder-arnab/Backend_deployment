@@ -14,7 +14,7 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.chains.question_answering import load_qa_chain
 from langchain.prompts import PromptTemplate
-from langchain_community.vectorstores import OracleVS
+from langchain_community.vectorstores import oraclevs
 from langchain_community.vectorstores.utils import DistanceStrategy
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
