@@ -34,7 +34,7 @@ if cors_origins:
     additional_origins = [origin.strip() for origin in cors_origins.split(',') if origin.strip()]
     allowed_origins.extend(additional_origins)
 
-CORS(app, resources={r"/*": {"origins": allowed_origins, "supports_credentials": True}})
+CORS(app, resources={r"/*": {"origins": allowed_origins, "supports_credentials": True, "allow_headers": ["Authorization", "Content-Type"]}})
 
 from file_api import initialize_connection_pool
 from user_api import initialize_connection_pool as initialize_user_connection_pool
@@ -93,6 +93,10 @@ def options_route(path):
     response = make_response()
     response.headers['Content-Type'] = 'text/plain'
     response.headers['Content-Length'] = '0'
+    response.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type'
+    response.headers['Access-Control-Allow-Credentials'] = 'true'
     return response
 
 @app.route('/')
