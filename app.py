@@ -26,7 +26,7 @@ app = Flask(__name__)
 allowed_origins = [
     'http://localhost:3000',
     'https://smart-crawler-fe.vercel.app',
-    'https://smart-crawler-6ghm35ek8-aniruddha-mukherjees-projects-00946ecf.vercel.app'
+    'https://smartcrawl-7joylrzf4-arnabpodder-ebiwcoms-projects.vercel.app'
 ]
 
 cors_origins = os.getenv('CORS_ORIGINS', '')
