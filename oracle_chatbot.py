@@ -1,15 +1,16 @@
+# Updated imports at the top of the file
 import os
 import json
 import time
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
 from datetime import datetime
 import traceback
+from typing import List, Optional, Dict, Any  # Add this import for type hints
 
 from dotenv import load_dotenv
 import google.generativeai as genai
 import oracledb
+
+# Langchain imports
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.chains.question_answering import load_qa_chain
@@ -21,6 +22,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # Load environment variables
 load_dotenv()
+
 # Different usernames for different databases
 ORACLE_USER_VECTDB = os.getenv("ORACLE_USER_VECTDB", "ANIRUDDHA1")
 ORACLE_USER_JSONDB = os.getenv("ORACLE_USER_JSONDB", "ANIRUDDHA")
@@ -183,7 +185,7 @@ def process_scrapped_text_to_vector_store(jsondb_connection, user_id=None, sourc
         )
         
         # Initialize vector store
-        vector_store = OracleVS(
+        vector_store = oraclevs.OracleVS(
             client=vectdb_connection,
             embedding_function=embeddings,
             table_name=VECTDB_TABLE_NAME,
@@ -824,20 +826,23 @@ def verify_api_key(api_key):
 
 async def process_chat_request(db_conn, message, session_id=None, api_key=None, source_level_url=None, user_id=None):
     """
-    Process a chat request, filtering by source_level_url in the METADATA JSON field
-    with simpler query approach
+    Process a chat request, strictly filtering by source_level_url
     
     Args:
         db_conn: Database connection
         message: User message
         session_id: Optional session ID
         api_key: API key for authorization
-        source_level_url: URL to restrict the knowledge retrieval context
+        source_level_url: REQUIRED URL to restrict the knowledge retrieval context
         user_id: User ID of the authenticated user
         
     Returns:
         ChatResponse object
     """
+    # Validate source_level_url
+    if not source_level_url:
+        raise ValueError("source_level_url is a required parameter for chat requests")
+    
     try:
         # Verify API key if required
         if VALID_API_KEYS and not verify_api_key(api_key):
@@ -867,7 +872,7 @@ async def process_chat_request(db_conn, message, session_id=None, api_key=None, 
                         session = json.loads(session_data)
                     else:
                         session = session_data
-                    title = session.get("title", "New Conversation")
+                    title = session.get("title", f"Conversation about {source_level_url}")
                     
                     # If user_id isn't in session but is provided, add it now
                     if user_id and not session.get("user_id"):
@@ -883,7 +888,7 @@ async def process_chat_request(db_conn, message, session_id=None, api_key=None, 
                         db_conn.commit()
                 else:
                     # Session ID was provided but doesn't exist. Create a new one.
-                    title = f"Conversation about {source_level_url}" if source_level_url else "New Conversation"
+                    title = f"Conversation about {source_level_url}"
                     new_session_id = str(int(time.time()))
                     new_session = ChatSession(session_id=new_session_id, title=title, user_id=user_id)
                     
@@ -901,7 +906,7 @@ async def process_chat_request(db_conn, message, session_id=None, api_key=None, 
                     session = new_session.to_dict()
             else:
                 # No session ID provided. Create a new session.
-                title = f"Conversation about {source_level_url}" if source_level_url else "New Conversation"
+                title = f"Conversation about {source_level_url}"
                 new_session_id = str(int(time.time()))
                 new_session = ChatSession(session_id=new_session_id, title=title, user_id=user_id)
                 
@@ -939,70 +944,35 @@ async def process_chat_request(db_conn, message, session_id=None, api_key=None, 
                 model="models/text-embedding-004"
             )
             
-            vector_store = OracleVS(
+            vector_store = oraclevs.OracleVS(
                 client=vectdb_connection,
                 embedding_function=embeddings,
                 table_name=VECTDB_TABLE_NAME,
                 distance_strategy=DistanceStrategy.COSINE,
             )
             
-            # Get query embedding and search Oracle Vector Store based on source_level_url if provided
-            if source_level_url:
-                print(f"Searching for content related to parent URL: {source_level_url}")
-                
-                # Approach 1: Use the Langchain search but filter the results afterward
-                docs = []
-                
-                try:
-                    # Get general documents
-                    all_docs = vector_store.similarity_search(message, k=20)  # Get more to filter from
-                    
-                    # Filter them by URL
-                    for doc in all_docs:
-                        # Handle LOB objects
-                        if isinstance(doc.page_content, oracledb.LOB):
-                            doc.page_content = doc.page_content.read()
-                        
-                        # Check the metadata for matching URL
-                        metadata = doc.metadata
-                        if isinstance(metadata, dict):
-                            metadata_str = str(metadata)
-                        elif isinstance(metadata, str):
-                            metadata_str = metadata
-                        elif isinstance(metadata, oracledb.LOB):
-                            metadata_str = metadata.read()
-                        else:
-                            metadata_str = str(metadata)
-                        
-                        # If the source_level_url appears in the metadata, include this document
-                        if source_level_url in metadata_str:
-                            docs.append(doc)
-                        
-                    print(f"Found {len(docs)} documents matching {source_level_url} out of {len(all_docs)} total")
-                    
-                    # If not enough matches, include some general docs
-                    if len(docs) < 3:
-                        remaining_slots = 5 - len(docs)
-                        general_docs = [d for d in all_docs if d not in docs][:remaining_slots]
-                        docs.extend(general_docs)
-                        print(f"Added {len(general_docs)} general documents to supplement results")
-                
-                except Exception as e:
-                    print(f"Error in document filtering: {e}")
-                    traceback.print_exc()
-                    # Fall back to standard search
-                    docs = vector_store.similarity_search(message, k=5)
-                    for doc in docs:
-                        if isinstance(doc.page_content, oracledb.LOB):
-                            doc.page_content = doc.page_content.read()
-            else:
-                # Standard search without URL filtering
-                docs = vector_store.similarity_search(message, k=5)
-                
-                # Handle LOB objects
-                for doc in docs:
-                    if isinstance(doc.page_content, oracledb.LOB):
-                        doc.page_content = doc.page_content.read()
+            # Strictly filter documents ONLY from the specified source_level_url
+            print(f"Strictly searching for content ONLY from: {source_level_url}")
+            
+            # Search with high k to have enough documents to filter
+            all_docs = vector_store.similarity_search(message, k=50)
+            
+            # Very strict filtering to ONLY include documents from the specified URL
+            docs = [
+                doc for doc in all_docs 
+                if source_level_url in str(doc.metadata)
+            ]
+            
+            # If not enough matches from the exact URL, raise a context limitation error
+            if len(docs) < 2:
+                response = ChatResponse(
+                    answer=f"Insufficient context available for the URL: {source_level_url}. Please ensure documents have been crawled and vectorized.",
+                    sources=[],
+                    session_id=session_id,
+                    title=f"Limited Context for {source_level_url}"
+                )
+                await update_session(db_conn, session_id, message, response.answer, user_id)
+                return response
             
             # Extract contents and sources
             contexts = [doc.page_content for doc in docs]
@@ -1021,20 +991,6 @@ async def process_chat_request(db_conn, message, session_id=None, api_key=None, 
                 else:
                     sources.append("N/A")
             
-            if not contexts:
-                response_message = "No relevant information found in the knowledge base."
-                if source_level_url:
-                    response_message += f" for the domain: {source_level_url}"
-                
-                response = ChatResponse(
-                    answer=response_message,
-                    sources=[],
-                    session_id=session_id,
-                    title=title
-                )
-                await update_session(db_conn, session_id, message, response.answer, user_id)
-                return response
-            
             # Prepare documents and chat history
             doc_objects = [Document(page_content=text) for text in contexts]
             
@@ -1044,16 +1000,13 @@ async def process_chat_request(db_conn, message, session_id=None, api_key=None, 
                 for msg in session.get("messages", [])[-4:] if session.get("messages", [])
             ])
             
-            # Define prompt template that acknowledges the parent URL
-            source_context = ""
-            if source_level_url:
-                source_context = f"\nFocus on information specifically from: {source_level_url} and its related pages."
-            
+            # Define prompt template that acknowledges the source_level_url
             prompt_template = f"""
             Previous conversation:
             {{chat_history}}
 
-            Use the following context to answer the question. Consider the previous conversation for context.{source_context}
+            Use the following context to answer the question. Consider the previous conversation for context.
+            Focus ONLY on information from the specific URL: {source_level_url}.
             If the answer is not in the provided context, say: "Answer is not available in the context."
             Do not provide incorrect information.
 
@@ -1084,21 +1037,17 @@ async def process_chat_request(db_conn, message, session_id=None, api_key=None, 
             
             answer_text = chain_response["output_text"]
             
-            # If source_level_url is provided and answer was found, add attribution
-            if source_level_url and "Answer is not available in the context" not in answer_text:
-                source_note = f"\n\nThis information is sourced from: {source_level_url} and its related pages."
-                answer_text += source_note
+            # Add attribution to the source URL
+            source_note = f"\n\nThis information is sourced exclusively from: {source_level_url}"
+            answer_text += source_note
             
             # Update session with new messages - pass user_id as well
             await update_session(db_conn, session_id, message, answer_text, user_id)
             
-            # Only include sources if the answer was found in the context
-            final_sources = sources if "Answer is not available in the context" not in answer_text else []
-            
             # Return response
             return ChatResponse(
                 answer=answer_text,
-                sources=final_sources,
+                sources=sources,
                 session_id=session_id,
                 title=title
             )
@@ -1108,11 +1057,11 @@ async def process_chat_request(db_conn, message, session_id=None, api_key=None, 
                 vectdb_connection.close()
     
     except Exception as e:
-        print(f"Error processing chat request: {e}")
+        print(f"Error processing chat request for {source_level_url}: {e}")
         traceback.print_exc()
         return ChatResponse(
-            answer=f"An error occurred while processing your request: {str(e)}",
+            answer=f"An error occurred while processing your request for {source_level_url}: {str(e)}",
             sources=[],
             session_id=session_id if session_id else "error",
-            title="Error"
+            title=f"Error - {source_level_url}"
         )
